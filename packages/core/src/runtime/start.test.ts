@@ -491,6 +491,153 @@ describe('start', () => {
     });
   });
 
+  describe('dynamic workflow source', () => {
+    let mockEventsCreate: ReturnType<typeof vi.fn>;
+    let mockQueue: ReturnType<typeof vi.fn>;
+
+    const validSource = `
+async function workflow(input) {
+  "use workflow";
+  const user = await steps.fetchUser(input.userId);
+  await steps.sendEmail(user.email);
+  return { ok: true };
+}`;
+
+    const fetchUser = Object.assign(async () => undefined, {
+      stepId: 'step//./steps//fetchUser',
+    });
+    const sendEmail = Object.assign(async () => undefined, {
+      stepId: 'step//./steps//sendEmail',
+    });
+
+    beforeEach(() => {
+      mockEventsCreate = vi.fn().mockImplementation((runId) => {
+        return Promise.resolve({
+          run: { runId: runId ?? 'wrun_test123', status: 'pending' },
+        });
+      });
+      mockQueue = vi.fn().mockResolvedValue({ messageId: null });
+
+      setWorld({
+        specVersion: SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT,
+        getDeploymentId: vi.fn().mockResolvedValue('deploy_123'),
+        events: { create: mockEventsCreate },
+        queue: mockQueue,
+      } as any);
+    });
+
+    afterEach(() => {
+      setWorld(undefined);
+      vi.clearAllMocks();
+    });
+
+    it('stores dynamic workflow code in executionContext and queues the generated workflow name', async () => {
+      await start(validSource, [{ userId: 'user_123' }], {
+        dynamic: {
+          id: 'ai-user-followup',
+          steps: { fetchUser, sendEmail },
+        },
+      });
+
+      const [, runCreated] = mockEventsCreate.mock.calls[0];
+      expect(runCreated.eventData.workflowName).toBe(
+        'workflow//dynamic/ai-user-followup//workflow'
+      );
+      expect(runCreated.eventData.executionContext.dynamicWorkflow).toEqual(
+        expect.objectContaining({
+          version: 1,
+          exportName: 'workflow',
+          sourceHash: expect.any(String),
+          workflowCode: expect.stringContaining('steps = Object.freeze'),
+        })
+      );
+      expect(
+        runCreated.eventData.executionContext.dynamicWorkflow.workflowCode
+      ).toContain('__dynamicUseStep("step//./steps//fetchUser")');
+
+      const [queueName, queuePayload] = mockQueue.mock.calls[0];
+      expect(queueName).toBe(
+        '__wkf_workflow_workflow//dynamic/ai-user-followup//workflow'
+      );
+      expect(queuePayload.runInput.workflowName).toBe(
+        'workflow//dynamic/ai-user-followup//workflow'
+      );
+      expect(queuePayload.runInput.executionContext.dynamicWorkflow).toEqual(
+        runCreated.eventData.executionContext.dynamicWorkflow
+      );
+    });
+
+    it('accepts explicit stepId references', async () => {
+      await start(validSource, [{ userId: 'user_123' }], {
+        dynamic: {
+          id: 'explicit-step-refs',
+          steps: {
+            fetchUser: { stepId: 'step//./steps//fetchUser' },
+            sendEmail: { stepId: 'step//./steps//sendEmail' },
+          },
+        },
+      });
+
+      const [, runCreated] = mockEventsCreate.mock.calls[0];
+      expect(
+        runCreated.eventData.executionContext.dynamicWorkflow.workflowCode
+      ).toContain('__dynamicUseStep("step//./steps//sendEmail")');
+    });
+
+    it('rejects source strings without dynamic options', async () => {
+      await expect(
+        // @ts-expect-error - intentionally missing dynamic options
+        start(validSource, [])
+      ).rejects.toThrow('Dynamic workflow source requires options.dynamic');
+    });
+
+    it('rejects missing steps', async () => {
+      await expect(
+        start(validSource, [], { dynamic: { steps: {} } })
+      ).rejects.toThrow('dynamic.steps');
+    });
+
+    it('rejects step aliases without stepId metadata', async () => {
+      await expect(
+        start(validSource, [], {
+          dynamic: {
+            steps: {
+              fetchUser: (async () => undefined) as any,
+              sendEmail,
+            },
+          },
+        })
+      ).rejects.toThrow('must be an imported step function');
+    });
+
+    it('rejects unsupported module syntax', async () => {
+      await expect(
+        start(`import { x } from './x';\n${validSource}`, [], {
+          dynamic: { steps: { fetchUser, sendEmail } },
+        })
+      ).rejects.toThrow('cannot contain import or export syntax');
+    });
+
+    it('rejects source without a use workflow directive', async () => {
+      await expect(
+        start('async function workflow() { return 1; }', [], {
+          dynamic: { steps: { fetchUser, sendEmail } },
+        })
+      ).rejects.toThrow('must start with a "use workflow" directive');
+    });
+
+    it('rejects unsafe ids', async () => {
+      await expect(
+        start(validSource, [], {
+          dynamic: {
+            id: 'bad/id',
+            steps: { fetchUser, sendEmail },
+          },
+        })
+      ).rejects.toThrow('Invalid dynamic workflow id');
+    });
+  });
+
   describe('overload type inference', () => {
     // Type-only assertions that don't execute start() at runtime.
     // We use expectTypeOf on the function signature's return type directly.
@@ -531,6 +678,18 @@ describe('start', () => {
         opts: { deploymentId: string }
       ) => Promise<Run<unknown>>;
       expectTypeOf<DeploymentIdOverload>().toMatchTypeOf<typeof start>();
+    });
+
+    it('should return Run<unknown> for dynamic workflow source', () => {
+      expectTypeOf<
+        (
+          source: string,
+          args: unknown[],
+          opts: {
+            dynamic: { steps: Record<string, { stepId: string }> };
+          }
+        ) => Promise<Run<unknown>>
+      >().toMatchTypeOf<typeof start>();
     });
   });
 });

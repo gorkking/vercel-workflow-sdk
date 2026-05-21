@@ -10,6 +10,8 @@ import { workflowEntrypoint } from './runtime.js';
 import {
   dehydrateStepReturnValue,
   dehydrateWorkflowArguments,
+  hydrateRunError,
+  hydrateWorkflowReturnValue,
 } from './serialization.js';
 
 vi.mock('@vercel/functions', () => ({
@@ -58,7 +60,7 @@ async function runWorkflowHandlerWithEvents(
             {
               requestId: 'req_test',
               attempt: 1,
-              queueName: '__wkf_workflow_workflow',
+              queueName: `__wkf_workflow_${workflowRun.workflowName}`,
               messageId: 'msg_test',
             }
           );
@@ -96,6 +98,95 @@ describe('workflowEntrypoint replay guards', () => {
   const getWorkflowTransformCode = (workflowName: string) =>
     `;globalThis.__private_workflows = new Map();
     globalThis.__private_workflows.set(${JSON.stringify(workflowName)}, ${workflowName});`;
+
+  it('uses dynamic workflow code from the run executionContext when present', async () => {
+    const ops: Promise<any>[] = [];
+    const workflowRun: WorkflowRun = {
+      runId: 'wrun_runtime_dynamic',
+      workflowName: 'workflow//dynamic/test-run//workflow',
+      status: 'running',
+      input: await dehydrateWorkflowArguments(
+        ['Ada'],
+        'wrun_runtime_dynamic',
+        undefined,
+        ops
+      ),
+      executionContext: {
+        dynamicWorkflow: {
+          version: 1,
+          sourceHash: 'hash',
+          exportName: 'workflow',
+          workflowCode: `
+            async function workflow(name) {
+              return "hello " + name;
+            }
+            ;globalThis.__private_workflows = new Map();
+            globalThis.__private_workflows.set("workflow//dynamic/test-run//workflow", workflow);
+          `,
+        },
+      },
+      createdAt: new Date('2024-01-01T00:00:00.000Z'),
+      updatedAt: new Date('2024-01-01T00:00:00.000Z'),
+      startedAt: new Date('2024-01-01T00:00:00.000Z'),
+      deploymentId: 'test-deployment',
+    };
+
+    const events: Event[] = [
+      {
+        eventId: 'event-0',
+        runId: workflowRun.runId,
+        eventType: 'run_created',
+        eventData: {
+          input: workflowRun.input,
+          deploymentId: workflowRun.deploymentId,
+          workflowName: workflowRun.workflowName,
+          executionContext: workflowRun.executionContext,
+        },
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        specVersion: SPEC_VERSION_CURRENT,
+      },
+      {
+        eventId: 'event-1',
+        runId: workflowRun.runId,
+        eventType: 'run_started',
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        specVersion: SPEC_VERSION_CURRENT,
+      },
+    ];
+
+    const createdEvents = await runWorkflowHandlerWithEvents(
+      `function workflow() { throw new Error("static bundle should not run"); }${getWorkflowTransformCode('workflow')}`,
+      workflowRun,
+      events
+    );
+
+    const runCompleted = createdEvents.find(
+      (event: any) => event.eventType === 'run_completed'
+    ) as any;
+    if (!runCompleted) {
+      const runFailed = createdEvents.find(
+        (event: any) => event.eventType === 'run_failed'
+      ) as any;
+      if (runFailed) {
+        const error = await hydrateRunError(
+          runFailed.eventData.error,
+          workflowRun.runId,
+          undefined,
+          ops
+        );
+        throw error;
+      }
+    }
+    expect(runCompleted).toBeDefined();
+    expect(
+      await hydrateWorkflowReturnValue(
+        runCompleted.eventData.output,
+        workflowRun.runId,
+        undefined,
+        ops
+      )
+    ).toBe('hello Ada');
+  });
 
   it('records run_failed when a committed wait_completed targets the wrong wait', async () => {
     const ops: Promise<any>[] = [];

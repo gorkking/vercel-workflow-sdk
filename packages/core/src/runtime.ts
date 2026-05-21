@@ -85,6 +85,9 @@ export {
   wakeUpRun,
 } from './runtime/runs.js';
 export {
+  type DynamicStartOptions,
+  type DynamicWorkflowOptions,
+  type DynamicWorkflowStepReference,
   type StartOptions,
   type StartOptionsBase,
   type StartOptionsWithDeploymentId,
@@ -781,8 +784,12 @@ export function workflowEntrypoint(
                         eventCount: events.length,
                       });
                       replayStart = Date.now();
-                      const result = await runWorkflow(
+                      const workflowCodeForRun = getWorkflowCodeForRun(
                         workflowCode,
+                        workflowRun
+                      );
+                      const result = await runWorkflow(
+                        workflowCodeForRun,
                         workflowRun,
                         events,
                         encryptionKey
@@ -1060,10 +1067,14 @@ export function workflowEntrypoint(
                           const parsedName = parseWorkflowName(workflowName);
                           const filename =
                             parsedName?.moduleSpecifier || workflowName;
+                          const workflowCodeForRun = getWorkflowCodeForRun(
+                            workflowCode,
+                            workflowRun
+                          );
                           errorStack = remapErrorStack(
                             errorStack,
                             filename,
-                            workflowCode
+                            workflowCodeForRun
                           );
                         }
 
@@ -1157,6 +1168,24 @@ export function workflowEntrypoint(
     if (!cachedHandler) {
       cachedHandler = handler(await getWorldHandlers());
     }
-    return cachedHandler(req);
+    return cachedHandler!(req);
   });
+}
+
+function getWorkflowCodeForRun(
+  staticWorkflowCode: string,
+  workflowRun: WorkflowRun
+): string {
+  const dynamicWorkflow = workflowRun.executionContext?.dynamicWorkflow;
+  if (
+    dynamicWorkflow &&
+    typeof dynamicWorkflow === 'object' &&
+    'version' in dynamicWorkflow &&
+    dynamicWorkflow.version === 1 &&
+    'workflowCode' in dynamicWorkflow &&
+    typeof dynamicWorkflow.workflowCode === 'string'
+  ) {
+    return dynamicWorkflow.workflowCode;
+  }
+  return staticWorkflowCode;
 }

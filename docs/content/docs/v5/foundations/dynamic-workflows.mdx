@@ -1,0 +1,131 @@
+---
+title: Dynamic Workflows
+description: Start trusted workflow source strings that orchestrate already-registered steps.
+type: conceptual
+summary: Run workflow code generated at runtime without adding a new build-time workflow file.
+prerequisites:
+  - /docs/foundations/workflows-and-steps
+  - /docs/foundations/starting-workflows
+related:
+  - /docs/api-reference/workflow-api/start
+  - /docs/foundations/serialization
+  - /docs/foundations/versioning
+---
+
+Dynamic workflows let you start a workflow from a JavaScript source string instead of importing a workflow function that was discovered at build time. This is useful when the orchestration is generated at runtime, such as from a workflow builder UI or an LLM.
+
+<Callout type="warning">
+Dynamic workflows are experimental. Treat the source as trusted application code. The workflow VM enforces the usual deterministic workflow runtime, but it is not a security sandbox for untrusted JavaScript.
+</Callout>
+
+## How it works
+
+Dynamic workflows reuse the normal Workflow SDK runtime. The dynamic source is compiled into per-run workflow VM code, stored on the run, and replayed from the event log just like a static workflow.
+
+For the MVP, dynamic workflows can only orchestrate step functions that are already registered in the deployment. Pass those step references through `dynamic.steps`, then call them from the source through the injected `steps` object.
+
+```typescript lineNumbers
+import { start } from "workflow/api";
+import { fetchUser, sendEmail } from "./steps";
+
+const source = `
+async function workflow(input) {
+  "use workflow";
+
+  const user = await steps.fetchUser(input.userId);
+  await steps.sendEmail(user.email);
+
+  return { ok: true };
+}
+`;
+
+const run = await start(
+  source,
+  [{ userId: "user_123" }],
+  {
+    dynamic: {
+      id: "ai-user-followup",
+      steps: { fetchUser, sendEmail },
+    },
+  },
+);
+```
+
+The generated workflow ID uses the form `workflow//dynamic/<id-or-hash>//<exportName>`. If you omit `id`, Workflow SDK derives one from the source and step references.
+
+## Generated with an LLM
+
+Keep the step catalog explicit. The model should choose from steps you provide, and your application should review or validate the generated source before starting it.
+
+```typescript lineNumbers
+import { generateText } from "ai";
+import { start } from "workflow/api";
+import { createTicket, lookupCustomer, sendSlackMessage } from "./steps";
+
+const stepCatalog = {
+  lookupCustomer,
+  createTicket,
+  sendSlackMessage,
+};
+
+const { text: source } = await generateText({
+  model: myModel,
+  system: `
+Generate one JavaScript async function named workflow.
+The first statement inside the function must be "use workflow".
+Only call tools through the injected steps object.
+Do not use import, export, TypeScript syntax, or inline step functions.
+`,
+  prompt: "When a customer reports a billing issue, look them up, create a ticket, and notify Slack.",
+});
+
+const run = await start(
+  source,
+  [{ customerId: "cus_123", issue: "Invoice looks wrong" }],
+  {
+    dynamic: {
+      id: "billing-triage",
+      steps: stepCatalog,
+    },
+  },
+);
+```
+
+## Options
+
+`dynamic.steps` is required. Each value can be an imported step function or an explicit `{ stepId }` reference.
+
+```typescript lineNumbers
+import { start } from "workflow/api";
+import { fetchUser, sendEmail } from "./steps";
+
+const source = `
+async function workflow(input) {
+  "use workflow";
+  return await steps.fetchUser(input.userId);
+}
+`;
+const input = { userId: "user_123" };
+
+await start(source, [input], {
+  dynamic: {
+    steps: {
+      fetchUser,
+      sendEmail: { stepId: "step//./steps//sendEmail" },
+    },
+    exportName: "workflow",
+  },
+});
+```
+
+`dynamic.exportName` defaults to `workflow`. Use it when your generated source defines a different async function name.
+
+## MVP limitations
+
+- Dynamic source must be JavaScript and must fit within the 32 KB source limit.
+- The source must define `async function workflow(...)` by default, or the function named by `dynamic.exportName`.
+- The first statement in that function must be `"use workflow";`.
+- `import` and `export` syntax are not supported.
+- Inline `"use step"` functions are not supported.
+- TypeScript syntax, runtime bundling, npm package imports, and custom class serialization registration are not supported.
+- Dynamic workflow source and generated VM code are stored with run metadata. Do not put secrets in generated source.

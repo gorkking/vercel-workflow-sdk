@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import {
   EntityConflictError,
@@ -20,9 +21,9 @@ import * as Attribute from '../telemetry/semantic-conventions.js';
 import { serializeTraceCarrier, trace } from '../telemetry.js';
 import { waitedUntil } from '../util.js';
 import { version as workflowCoreVersion } from '../version.js';
+import { getWorldLazy } from './get-world-lazy.js';
 import { getWorkflowQueueName } from './helpers.js';
 import { Run } from './run.js';
-import { getWorldLazy } from './get-world-lazy.js';
 
 /** ULID generator for client-side runId generation */
 const ulid = monotonicFactory();
@@ -68,6 +69,33 @@ export type StartOptions =
   | StartOptionsWithDeploymentId
   | StartOptionsWithoutDeploymentId;
 
+export type DynamicWorkflowStepReference = { readonly stepId: string };
+
+export interface DynamicWorkflowOptions {
+  /**
+   * Already-registered step functions exposed to the dynamic workflow source.
+   *
+   * Each value may be an imported step function transformed by Workflow SDK
+   * (with a `.stepId` property) or an explicit `{ stepId }` reference.
+   */
+  steps: Record<string, DynamicWorkflowStepReference>;
+
+  /**
+   * Optional stable ID segment for the generated workflow ID. Defaults to a
+   * hash of the source and referenced steps.
+   */
+  id?: string;
+
+  /**
+   * Name of the async workflow function in the source. Defaults to "workflow".
+   */
+  exportName?: string;
+}
+
+export type DynamicStartOptions = StartOptions & {
+  dynamic: DynamicWorkflowOptions;
+};
+
 /**
  * Represents an imported workflow function.
  */
@@ -79,6 +107,164 @@ export type WorkflowFunction<TArgs extends unknown[], TResult> = (
  * Represents the generated metadata of a workflow function.
  */
 export type WorkflowMetadata = { workflowId: string };
+
+export interface DynamicWorkflowExecutionContext {
+  version: 1;
+  workflowCode: string;
+  sourceHash: string;
+  exportName: string;
+}
+
+const DYNAMIC_WORKFLOW_SOURCE_MAX_BYTES = 32 * 1024;
+const SAFE_DYNAMIC_ID_SEGMENT = /^[a-zA-Z0-9_.@-]+$/;
+const SAFE_DYNAMIC_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const UNSUPPORTED_DYNAMIC_MODULE_SYNTAX =
+  /(^|[\s;])(?:import\s*(?:[\w*{]|\(|['"])|export\s+(?:async\s+)?(?:function|const|let|var|class|default|\{|\*))/m;
+
+function stableJsonStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJsonStringify).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, val]) => `${JSON.stringify(key)}:${stableJsonStringify(val)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input).digest('hex');
+}
+
+function assertDynamicWorkflowIdentifier(kind: string, value: string) {
+  if (!SAFE_DYNAMIC_IDENTIFIER.test(value)) {
+    throw new WorkflowRuntimeError(
+      `Invalid dynamic workflow ${kind} "${value}". Use only letters, numbers, and underscores, and start with a letter or underscore.`
+    );
+  }
+}
+
+function validateDynamicWorkflowSource(source: string, exportName: string) {
+  if (Buffer.byteLength(source, 'utf8') > DYNAMIC_WORKFLOW_SOURCE_MAX_BYTES) {
+    throw new WorkflowRuntimeError(
+      `Dynamic workflow source is too large. The MVP limit is ${DYNAMIC_WORKFLOW_SOURCE_MAX_BYTES} bytes.`
+    );
+  }
+
+  if (UNSUPPORTED_DYNAMIC_MODULE_SYNTAX.test(source)) {
+    throw new WorkflowRuntimeError(
+      'Dynamic workflow source cannot contain import or export syntax in the MVP.'
+    );
+  }
+
+  const functionMatch = new RegExp(
+    `\\basync\\s+function\\s+${exportName}\\s*\\([^)]*\\)\\s*\\{`
+  ).exec(source);
+  if (!functionMatch) {
+    throw new WorkflowRuntimeError(
+      `Dynamic workflow source must define async function ${exportName}(...).`
+    );
+  }
+
+  const bodyStart = functionMatch.index + functionMatch[0].length;
+  const bodyPrefix = source.slice(bodyStart, bodyStart + 200);
+  if (!/^\s*(?:"use workflow"|'use workflow')\s*;/.test(bodyPrefix)) {
+    throw new WorkflowRuntimeError(
+      `Dynamic workflow function "${exportName}" must start with a "use workflow" directive.`
+    );
+  }
+}
+
+function getDynamicStepId(alias: string, value: unknown): string {
+  const stepId =
+    (value && typeof value === 'object') || typeof value === 'function'
+      ? (value as { stepId?: unknown }).stepId
+      : undefined;
+
+  if (typeof stepId !== 'string' || stepId.length === 0) {
+    throw new WorkflowRuntimeError(
+      `Dynamic workflow step "${alias}" must be an imported step function or an object with a non-empty stepId.`
+    );
+  }
+
+  return stepId;
+}
+
+function compileDynamicWorkflowSource(
+  source: string,
+  options: DynamicWorkflowOptions
+): {
+  workflowName: string;
+  dynamicWorkflow: DynamicWorkflowExecutionContext;
+} {
+  const exportName = options.exportName ?? 'workflow';
+  assertDynamicWorkflowIdentifier('exportName', exportName);
+  validateDynamicWorkflowSource(source, exportName);
+
+  if (!options.steps || Object.keys(options.steps).length === 0) {
+    throw new WorkflowRuntimeError(
+      'Dynamic workflow options must include at least one registered step in dynamic.steps.'
+    );
+  }
+
+  const stepEntries = Object.entries(options.steps)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([alias, value]) => {
+      assertDynamicWorkflowIdentifier(`step alias`, alias);
+      return [alias, getDynamicStepId(alias, value)] as const;
+    });
+
+  const sourceHash = sha256Hex(
+    `${source}\n${stableJsonStringify(Object.fromEntries(stepEntries))}`
+  );
+  const id = options.id ?? sourceHash.slice(0, 32);
+  if (!SAFE_DYNAMIC_ID_SEGMENT.test(id)) {
+    throw new WorkflowRuntimeError(
+      `Invalid dynamic workflow id "${id}". Use only letters, numbers, underscores, hyphens, dots, and @.`
+    );
+  }
+
+  const workflowName = `workflow//dynamic/${id}//${exportName}`;
+  const stepProxyEntries = stepEntries
+    .map(
+      ([alias, stepId]) =>
+        `${JSON.stringify(alias)}: __dynamicUseStep(${JSON.stringify(stepId)})`
+    )
+    .join(',\n  ');
+
+  const workflowCode = `
+globalThis.__private_workflows = new Map();
+const __dynamicUseStep = globalThis[Symbol.for("WORKFLOW_USE_STEP")];
+if (typeof __dynamicUseStep !== "function") {
+  throw new Error("WORKFLOW_USE_STEP is not available in the workflow VM.");
+}
+const steps = Object.freeze({
+  ${stepProxyEntries}
+});
+const sleep = globalThis[Symbol.for("WORKFLOW_SLEEP")];
+const createHook = globalThis[Symbol.for("WORKFLOW_CREATE_HOOK")];
+${source}
+Object.defineProperty(${exportName}, "workflowId", {
+  value: ${JSON.stringify(workflowName)},
+  writable: false,
+  enumerable: false,
+  configurable: false
+});
+globalThis.__private_workflows.set(${JSON.stringify(workflowName)}, ${exportName});
+`;
+
+  return {
+    workflowName,
+    dynamicWorkflow: {
+      version: 1,
+      workflowCode,
+      sourceHash,
+      exportName,
+    },
+  };
+}
 
 /**
  * Starts a workflow run.
@@ -114,15 +300,48 @@ export function start<TResult>(
   options?: StartOptionsWithoutDeploymentId
 ): Promise<Run<TResult>>;
 
+export function start(
+  source: string,
+  args: unknown[],
+  options: DynamicStartOptions
+): Promise<Run<unknown>>;
+
+export function start(
+  source: string,
+  options: DynamicStartOptions
+): Promise<Run<unknown>>;
+
 export async function start<TArgs extends unknown[], TResult>(
-  workflow: WorkflowFunction<TArgs, TResult> | WorkflowMetadata,
-  argsOrOptions?: TArgs | StartOptions,
-  options?: StartOptions
+  workflow: WorkflowFunction<TArgs, TResult> | WorkflowMetadata | string,
+  argsOrOptions?: TArgs | StartOptions | DynamicStartOptions,
+  options?: StartOptions | DynamicStartOptions
 ) {
   'use step';
   return await waitedUntil(() => {
-    // @ts-expect-error this field is added by our client transform
-    const workflowName = workflow?.workflowId;
+    let args: Serializable[] = [];
+    let opts: StartOptions | DynamicStartOptions = options ?? {};
+    if (Array.isArray(argsOrOptions)) {
+      args = argsOrOptions as Serializable[];
+    } else if (typeof argsOrOptions === 'object') {
+      opts = argsOrOptions;
+    }
+
+    let dynamicWorkflow: DynamicWorkflowExecutionContext | undefined;
+    let workflowName: string | undefined;
+    if (typeof workflow === 'string') {
+      const dynamicOptions = (opts as Partial<DynamicStartOptions>).dynamic;
+      if (!dynamicOptions) {
+        throw new WorkflowRuntimeError(
+          'Dynamic workflow source requires options.dynamic.'
+        );
+      }
+      const compiled = compileDynamicWorkflowSource(workflow, dynamicOptions);
+      workflowName = compiled.workflowName;
+      dynamicWorkflow = compiled.dynamicWorkflow;
+    } else {
+      // @ts-expect-error this field is added by our client transform
+      workflowName = workflow?.workflowId;
+    }
 
     if (!workflowName) {
       throw new WorkflowRuntimeError(
@@ -136,14 +355,6 @@ export async function start<TArgs extends unknown[], TResult>(
         ...Attribute.WorkflowName(workflowName),
         ...Attribute.WorkflowOperation('start'),
       });
-
-      let args: Serializable[] = [];
-      let opts: StartOptions = options ?? {};
-      if (Array.isArray(argsOrOptions)) {
-        args = argsOrOptions as Serializable[];
-      } else if (typeof argsOrOptions === 'object') {
-        opts = argsOrOptions;
-      }
 
       span?.setAttributes({
         ...Attribute.WorkflowArgumentsCount(args.length),
@@ -211,6 +422,7 @@ export async function start<TArgs extends unknown[], TResult>(
         traceCarrier,
         workflowCoreVersion,
         features: { encryption: !!encryptionKey },
+        ...(dynamicWorkflow ? { dynamicWorkflow } : {}),
       };
 
       // Call events.create (run_created) and queue in parallel.
