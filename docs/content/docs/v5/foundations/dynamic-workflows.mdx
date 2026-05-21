@@ -51,7 +51,43 @@ const run = await start(
 );
 ```
 
-The generated workflow ID uses the form `workflow//dynamic/<id-or-hash>//<exportName>`. If you omit `id`, Workflow SDK derives one from the source and step references.
+The generated workflow ID uses the form `workflow//dynamic/<id-or-hash>//<exportName>`. The `id` field is optional. Use it when you want a stable, human-readable workflow ID segment for queue names, run filtering, and observability. If you omit `id`, Workflow SDK derives one from the source and step references.
+
+## Predefined runtime globals
+
+Dynamic workflow source does not use imports. The runtime predefines these bindings inside the generated workflow VM code:
+
+| Binding | Description |
+| --- | --- |
+| `steps` | A frozen object containing the step aliases passed through `dynamic.steps`. |
+| `sleep` | The Workflow SDK sleep primitive for durable waits and timers. |
+| `createHook` | The Workflow SDK hook primitive for durable external resume signals. |
+
+The source also runs inside the normal deterministic workflow VM, so standard sandbox globals such as `Date`, `Math.random`, `crypto`, `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`, `structuredClone`, `atob`, and `btoa` are available with the same determinism constraints as static workflows.
+
+For the MVP, `createWebhook` and `getWritable` are not predefined in dynamic source.
+
+```typescript lineNumbers
+const source = `
+async function workflow(input) {
+  "use workflow";
+
+  await sleep("15m");
+
+  const approval = createHook({ token: "approval-" + input.userId });
+  const result = await Promise.race([
+    approval,
+    sleep("1d").then(() => ({ approved: false, timedOut: true })),
+  ]);
+
+  if (result.approved) {
+    await steps.sendEmail(input.email);
+  }
+
+  return result;
+}
+`;
+```
 
 ## Generated with an LLM
 
@@ -73,8 +109,9 @@ const { text: source } = await generateText({
   system: `
 Generate one JavaScript async function named workflow.
 The first statement inside the function must be "use workflow".
-Only call tools through the injected steps object.
-Do not use import, export, TypeScript syntax, or inline step functions.
+Use only these predefined runtime globals: steps, sleep, createHook.
+Only call step functions through the injected steps object.
+Do not use import, export, TypeScript syntax, inline step functions, createWebhook, or getWritable.
 `,
   prompt: "When a customer reports a billing issue, look them up, create a ticket, and notify Slack.",
 });
@@ -119,6 +156,8 @@ await start(source, [input], {
 ```
 
 `dynamic.exportName` defaults to `workflow`. Use it when your generated source defines a different async function name.
+
+`dynamic.id` is optional. It does not affect the workflow logic. It only controls the stable ID segment in the generated workflow name. When omitted, Workflow SDK uses a hash of the source and step references.
 
 ## MVP limitations
 
