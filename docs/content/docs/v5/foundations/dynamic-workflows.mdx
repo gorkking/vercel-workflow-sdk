@@ -155,6 +155,10 @@ await start(source, [input], {
 
 `dynamic.exportName` defaults to `workflow`. Use it when your generated source defines a different async function name.
 
+## Source storage
+
+The current prototype stores generated workflow VM code inline with run metadata. Before broad release, dynamic workflow source/code should move to encrypted ref-backed storage so sensitive generated source is protected by the same run encryption model as workflow inputs and step data, and longer workflows do not have to fit inside run metadata storage limits.
+
 ## MVP limitations
 
 - Dynamic source must be JavaScript and must fit within the 32 KB source limit.
@@ -163,4 +167,4 @@ await start(source, [input], {
 - `import` and `export` syntax are not supported.
 - Inline `"use step"` functions are not supported.
 - TypeScript syntax, runtime bundling, npm package imports, and custom class serialization registration are not supported.
-- Dynamic workflow source and generated VM code are stored with run metadata. Do not put secrets in generated source.
+- The current prototype stores generated workflow code inline in run metadata. Do not put secrets in generated source until source/code storage moves to encrypted refs.
