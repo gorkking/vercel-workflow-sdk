@@ -105,7 +105,6 @@ async function workflow(input) {
 
 const run = await start(source, [{ userId: "user_123" }], {
   dynamic: {
-    id: "ai-user-followup",
     steps: { fetchUser, sendEmail },
   },
 });

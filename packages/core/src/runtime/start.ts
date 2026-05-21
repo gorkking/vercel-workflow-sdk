@@ -81,12 +81,6 @@ export interface DynamicWorkflowOptions {
   steps: Record<string, DynamicWorkflowStepReference>;
 
   /**
-   * Optional stable ID segment for the generated workflow ID. Defaults to a
-   * hash of the source and referenced steps.
-   */
-  id?: string;
-
-  /**
    * Name of the async workflow function in the source. Defaults to "workflow".
    */
   exportName?: string;
@@ -116,7 +110,6 @@ export interface DynamicWorkflowExecutionContext {
 }
 
 const DYNAMIC_WORKFLOW_SOURCE_MAX_BYTES = 32 * 1024;
-const SAFE_DYNAMIC_ID_SEGMENT = /^[a-zA-Z0-9_.@-]+$/;
 const SAFE_DYNAMIC_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const UNSUPPORTED_DYNAMIC_MODULE_SYNTAX =
   /(^|[\s;])(?:import\s*(?:[\w*{]|\(|['"])|export\s+(?:async\s+)?(?:function|const|let|var|class|default|\{|\*))/m;
@@ -200,6 +193,11 @@ function compileDynamicWorkflowSource(
   dynamicWorkflow: DynamicWorkflowExecutionContext;
 } {
   const exportName = options.exportName ?? 'workflow';
+  if ('id' in options) {
+    throw new WorkflowRuntimeError(
+      'dynamic.id is not supported. Dynamic workflow IDs are generated from the source and step references.'
+    );
+  }
   assertDynamicWorkflowIdentifier('exportName', exportName);
   validateDynamicWorkflowSource(source, exportName);
 
@@ -219,14 +217,9 @@ function compileDynamicWorkflowSource(
   const sourceHash = sha256Hex(
     `${source}\n${stableJsonStringify(Object.fromEntries(stepEntries))}`
   );
-  const id = options.id ?? sourceHash.slice(0, 32);
-  if (!SAFE_DYNAMIC_ID_SEGMENT.test(id)) {
-    throw new WorkflowRuntimeError(
-      `Invalid dynamic workflow id "${id}". Use only letters, numbers, underscores, hyphens, dots, and @.`
-    );
-  }
+  const workflowIdSegment = sourceHash.slice(0, 32);
 
-  const workflowName = `workflow//dynamic/${id}//${exportName}`;
+  const workflowName = `workflow//dynamic/${workflowIdSegment}//${exportName}`;
   const stepProxyEntries = stepEntries
     .map(
       ([alias, stepId]) =>

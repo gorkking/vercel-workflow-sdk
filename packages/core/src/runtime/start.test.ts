@@ -534,15 +534,15 @@ async function workflow(input) {
     it('stores dynamic workflow code in executionContext and queues the generated workflow name', async () => {
       await start(validSource, [{ userId: 'user_123' }], {
         dynamic: {
-          id: 'ai-user-followup',
           steps: { fetchUser, sendEmail },
         },
       });
 
       const [, runCreated] = mockEventsCreate.mock.calls[0];
-      expect(runCreated.eventData.workflowName).toBe(
-        'workflow//dynamic/ai-user-followup//workflow'
-      );
+      const dynamicWorkflow =
+        runCreated.eventData.executionContext.dynamicWorkflow;
+      const expectedWorkflowName = `workflow//dynamic/${dynamicWorkflow.sourceHash.slice(0, 32)}//workflow`;
+      expect(runCreated.eventData.workflowName).toBe(expectedWorkflowName);
       expect(runCreated.eventData.executionContext.dynamicWorkflow).toEqual(
         expect.objectContaining({
           version: 1,
@@ -556,12 +556,8 @@ async function workflow(input) {
       ).toContain('__dynamicUseStep("step//./steps//fetchUser")');
 
       const [queueName, queuePayload] = mockQueue.mock.calls[0];
-      expect(queueName).toBe(
-        '__wkf_workflow_workflow//dynamic/ai-user-followup//workflow'
-      );
-      expect(queuePayload.runInput.workflowName).toBe(
-        'workflow//dynamic/ai-user-followup//workflow'
-      );
+      expect(queueName).toBe(`__wkf_workflow_${expectedWorkflowName}`);
+      expect(queuePayload.runInput.workflowName).toBe(expectedWorkflowName);
       expect(queuePayload.runInput.executionContext.dynamicWorkflow).toEqual(
         runCreated.eventData.executionContext.dynamicWorkflow
       );
@@ -570,7 +566,6 @@ async function workflow(input) {
     it('accepts explicit stepId references', async () => {
       await start(validSource, [{ userId: 'user_123' }], {
         dynamic: {
-          id: 'explicit-step-refs',
           steps: {
             fetchUser: { stepId: 'step//./steps//fetchUser' },
             sendEmail: { stepId: 'step//./steps//sendEmail' },
@@ -626,15 +621,16 @@ async function workflow(input) {
       ).rejects.toThrow('must start with a "use workflow" directive');
     });
 
-    it('rejects unsafe ids', async () => {
+    it('rejects custom dynamic workflow ids', async () => {
       await expect(
         start(validSource, [], {
           dynamic: {
-            id: 'bad/id',
+            // @ts-expect-error - dynamic IDs are generated from source + steps
+            id: 'custom-id',
             steps: { fetchUser, sendEmail },
           },
         })
-      ).rejects.toThrow('Invalid dynamic workflow id');
+      ).rejects.toThrow('dynamic.id is not supported');
     });
   });
 

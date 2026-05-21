@@ -44,14 +44,13 @@ const run = await start(
   [{ userId: "user_123" }],
   {
     dynamic: {
-      id: "ai-user-followup",
       steps: { fetchUser, sendEmail },
     },
   },
 );
 ```
 
-The generated workflow ID uses the form `workflow//dynamic/<id-or-hash>//<exportName>`. The `id` field is optional. Use it when you want a stable, human-readable workflow ID segment for queue names, run filtering, and observability. If you omit `id`, Workflow SDK derives one from the source and step references.
+The generated workflow ID uses the form `workflow//dynamic/<source-hash>//<exportName>`. Workflow SDK derives the hash from the source and step references so the same dynamic workflow source gets a stable generated workflow name.
 
 ## Predefined runtime globals
 
@@ -121,7 +120,6 @@ const run = await start(
   [{ customerId: "cus_123", issue: "Invoice looks wrong" }],
   {
     dynamic: {
-      id: "billing-triage",
       steps: stepCatalog,
     },
   },
@@ -156,8 +154,6 @@ await start(source, [input], {
 ```
 
 `dynamic.exportName` defaults to `workflow`. Use it when your generated source defines a different async function name.
-
-`dynamic.id` is optional. It does not affect the workflow logic. It only controls the stable ID segment in the generated workflow name. When omitted, Workflow SDK uses a hash of the source and step references.
 
 ## MVP limitations
 
