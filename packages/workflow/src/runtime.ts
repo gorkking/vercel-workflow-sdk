@@ -2,10 +2,11 @@ export {
   createWorld,
   getWorld,
   getWorldHandlers,
-  healthCheck,
   type HealthCheckEndpoint,
   type HealthCheckOptions,
   type HealthCheckResult,
+  healthCheck,
+  registerStepFunctionLoader,
   setWorld,
   workflowEntrypoint,
 } from '@workflow/core/runtime';
