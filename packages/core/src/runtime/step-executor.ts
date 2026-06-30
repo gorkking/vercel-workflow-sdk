@@ -16,7 +16,7 @@ import {
 } from '@workflow/world';
 import type { CryptoKey } from '../encryption.js';
 import { runtimeLogger, stepLogger } from '../logger.js';
-import { getStepFunction } from '../private.js';
+import { loadStepFunction } from '../private.js';
 import {
   dehydrateStepError,
   dehydrateStepReturnValue,
@@ -197,89 +197,6 @@ export async function executeStep(
     // fetch / HKDF derivation; subsequent callers await the cached promise.
     const getEncryptionKey = memoizeEncryptionKey(world, workflowRunId);
 
-    const stepFn = getStepFunction(stepName);
-    if (!stepFn || typeof stepFn !== 'function') {
-      // Step function not registered — fail the step immediately (not the run).
-      // This matches the V1 step handler pattern: create step_failed event so
-      // the workflow can handle it gracefully via try/catch in user code.
-      const errorMessage = `Step "${stepName}" is not registered in the current deployment. This usually indicates a build or bundling issue that caused the step to not be included in the deployment.`;
-      runtimeLogger.error('Step function not registered, failing step', {
-        workflowRunId,
-        stepName,
-        stepId,
-      });
-      // On the lazy inline path the suspension handler deferred this step's
-      // `step_created`, expecting executeStep to materialize the step via a
-      // lazy `step_started` carrying its input. We never get that far for an
-      // unregistered step, so the step entity does not exist yet — writing
-      // `step_failed` straight away would hit the world's "step must exist"
-      // ordering guard and wedge the run. Send the lazy `step_started` first
-      // (it creates the step + synthetic `step_created` atomically and keeps
-      // replay correct), then fail it below. This also preserves the
-      // exactly-one-owner guarantee: a concurrent handler that won the create
-      // makes our lazy `step_started` reject with EntityConflictError → we
-      // return `skipped` and never write the failure twice.
-      if (params.lazyStepInput !== undefined) {
-        try {
-          // Turbo: this lazy `step_started` must not precede the backgrounded
-          // `run_started`. Order it after the run-ready barrier (best-effort —
-          // a barrier rejection means the run doesn't exist, and the create
-          // below surfaces the real error). No-op outside turbo.
-          if (params.runReadyBarrier) {
-            await params.runReadyBarrier.catch(() => {});
-          }
-          await world.events.create(workflowRunId, {
-            eventType: 'step_started',
-            specVersion: SPEC_VERSION_CURRENT,
-            correlationId: stepId,
-            eventData: { stepName, workflowName, input: params.lazyStepInput },
-          });
-        } catch (startErr) {
-          if (EntityConflictError.is(startErr)) {
-            return { type: 'skipped' };
-          }
-          if (RunExpiredError.is(startErr)) {
-            return { type: 'gone' };
-          }
-          throw startErr;
-        }
-      }
-      try {
-        await world.events.create(workflowRunId, {
-          eventType: 'step_failed',
-          specVersion: SPEC_VERSION_CURRENT,
-          correlationId: stepId,
-          eventData: {
-            stepName,
-            error: await dehydrateStepError(
-              new FatalError(errorMessage),
-              workflowRunId,
-              await getEncryptionKey(),
-              [],
-              globalThis,
-              compression
-            ),
-          },
-        });
-      } catch (stepFailErr) {
-        if (EntityConflictError.is(stepFailErr)) {
-          return { type: 'skipped' };
-        }
-        throw stepFailErr;
-      }
-      span?.setAttributes({
-        ...Attribute.StepStatus('failed'),
-        ...Attribute.StepFatalError(true),
-      });
-      return { type: 'failed' };
-    }
-
-    const maxRetries = stepFn.maxRetries ?? DEFAULT_STEP_MAX_RETRIES;
-
-    span?.setAttributes({
-      ...Attribute.StepMaxRetries(maxRetries),
-    });
-
     // Maps a `step_started` rejection to a terminal StepExecutionResult,
     // shared by the await path (below) and the optimistic-start reconciliation.
     // Returns undefined when the error is not one we translate (caller rethrows).
@@ -446,6 +363,110 @@ export async function executeStep(
 
     span?.setAttributes({
       ...Attribute.StepStatus(step.status),
+    });
+
+    let stepFn: Awaited<ReturnType<typeof loadStepFunction>>;
+    try {
+      stepFn = await loadStepFunction(stepName);
+    } catch (err) {
+      if (optimisticStart) {
+        const reconcile = await reconcileOptimisticStart();
+        if (reconcile) return reconcile;
+      }
+
+      const normalizedError = await normalizeUnknownError(err);
+      const normalizedStack = normalizedError.stack || getErrorStack(err) || '';
+      const wrappedError = new FatalError(
+        `Failed to load step "${stepName}": ${normalizedError.message}`
+      );
+      (wrappedError as Error).cause = err;
+      if (normalizedStack) wrappedError.stack = normalizedStack;
+
+      stepLogger.error('Failed to load step function, failing step', {
+        workflowRunId,
+        stepName,
+        errorStack: normalizedStack,
+      });
+
+      try {
+        await world.events.create(workflowRunId, {
+          eventType: 'step_failed',
+          specVersion: SPEC_VERSION_CURRENT,
+          correlationId: stepId,
+          eventData: {
+            stepName,
+            error: await dehydrateStepError(
+              wrappedError,
+              workflowRunId,
+              await getEncryptionKey(),
+              [],
+              globalThis,
+              compression
+            ),
+          },
+        });
+      } catch (stepFailErr) {
+        if (EntityConflictError.is(stepFailErr)) {
+          return { type: 'skipped' };
+        }
+        throw stepFailErr;
+      }
+
+      span?.setAttributes({
+        ...Attribute.StepStatus('failed'),
+        ...Attribute.StepFatalError(true),
+      });
+      return { type: 'failed' };
+    }
+
+    if (!stepFn || typeof stepFn !== 'function') {
+      // Step function not registered — fail the step (not the run).
+      const errorMessage = `Step "${stepName}" is not registered in the current deployment. This usually indicates a build or bundling issue that caused the step to not be included in the deployment.`;
+      runtimeLogger.error('Step function not registered, failing step', {
+        workflowRunId,
+        stepName,
+        stepId,
+      });
+
+      if (optimisticStart) {
+        const reconcile = await reconcileOptimisticStart();
+        if (reconcile) return reconcile;
+      }
+
+      try {
+        await world.events.create(workflowRunId, {
+          eventType: 'step_failed',
+          specVersion: SPEC_VERSION_CURRENT,
+          correlationId: stepId,
+          eventData: {
+            stepName,
+            error: await dehydrateStepError(
+              new FatalError(errorMessage),
+              workflowRunId,
+              await getEncryptionKey(),
+              [],
+              globalThis,
+              compression
+            ),
+          },
+        });
+      } catch (stepFailErr) {
+        if (EntityConflictError.is(stepFailErr)) {
+          return { type: 'skipped' };
+        }
+        throw stepFailErr;
+      }
+      span?.setAttributes({
+        ...Attribute.StepStatus('failed'),
+        ...Attribute.StepFatalError(true),
+      });
+      return { type: 'failed' };
+    }
+
+    const maxRetries = stepFn.maxRetries ?? DEFAULT_STEP_MAX_RETRIES;
+
+    span?.setAttributes({
+      ...Attribute.StepMaxRetries(maxRetries),
     });
 
     let result: unknown;

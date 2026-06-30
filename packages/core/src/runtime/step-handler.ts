@@ -21,7 +21,7 @@ import {
 } from '@workflow/world';
 import { describeError } from '../describe-error.js';
 import { runtimeLogger, stepLogger } from '../logger.js';
-import { getStepFunction } from '../private.js';
+import { loadStepFunction } from '../private.js';
 import {
   cancelAbortReaders,
   dehydrateStepError,
@@ -237,11 +237,6 @@ function createStepHandler(namespace?: string) {
               ...getQueueOverhead({ requestedAt }),
             });
 
-            // Note: Step function validation happens after step_started so we can
-            // properly fail the step (not the run) if the function is not registered.
-            // This allows the workflow to handle the step failure gracefully.
-            const stepFn = getStepFunction(stepName);
-
             span?.setAttributes({
               ...Attribute.WorkflowName(workflowName),
               ...Attribute.WorkflowRunId(workflowRunId),
@@ -369,6 +364,80 @@ function createStepHandler(namespace?: string) {
             span?.setAttributes({
               ...Attribute.StepStatus(step.status),
             });
+
+            let stepFn: Awaited<ReturnType<typeof loadStepFunction>>;
+            try {
+              stepFn = await loadStepFunction(stepName);
+            } catch (err) {
+              const normalizedError = await normalizeUnknownError(err);
+              const normalizedStack =
+                normalizedError.stack || getErrorStack(err) || '';
+              const wrappedError = new FatalError(
+                `Failed to load step "${stepName}": ${normalizedError.message}`
+              );
+              (wrappedError as Error).cause = err;
+              if (normalizedStack) wrappedError.stack = normalizedStack;
+
+              stepRuntimeLogger.error(
+                'Failed to load step function, failing step (not run)',
+                {
+                  errorName: wrappedError.name,
+                  errorMessage: wrappedError.message,
+                  errorStack: normalizedStack,
+                }
+              );
+
+              try {
+                await world.events.create(
+                  workflowRunId,
+                  {
+                    eventType: 'step_failed',
+                    specVersion: SPEC_VERSION_CURRENT,
+                    correlationId: stepId,
+                    eventData: {
+                      stepName,
+                      error: await dehydrateStepError(
+                        wrappedError,
+                        workflowRunId,
+                        await getEncryptionKey(),
+                        [],
+                        globalThis,
+                        compressionForStep()
+                      ),
+                    },
+                  },
+                  { requestId }
+                );
+              } catch (stepFailErr) {
+                if (EntityConflictError.is(stepFailErr)) {
+                  stepRuntimeLogger.info(
+                    'Tried failing step for module load failure, but step has already finished.',
+                    {
+                      errorName: stepFailErr.name,
+                      errorMessage: stepFailErr.message,
+                    }
+                  );
+                  return;
+                }
+                throw stepFailErr;
+              }
+
+              span?.setAttributes({
+                ...Attribute.StepStatus('failed'),
+                ...Attribute.StepFatalError(true),
+              });
+
+              await queueMessage(
+                world,
+                getWorkflowQueueName(workflowName, resolvedNamespace),
+                {
+                  runId: workflowRunId,
+                  traceCarrier: await nextTraceCarrier(),
+                  requestedAt: new Date(),
+                }
+              );
+              return;
+            }
 
             // Validate step function exists AFTER step_started so we can
             // properly fail the step (not the run) if the function is missing.

@@ -175,7 +175,7 @@ vi.mock('../types.js', () => ({
 
 // Mock private module
 vi.mock('../private.js', () => ({
-  getStepFunction: vi.fn().mockReturnValue(mockStepFn),
+  loadStepFunction: vi.fn().mockResolvedValue(mockStepFn),
 }));
 
 // Mock get-port
@@ -183,7 +183,7 @@ vi.mock('@workflow/utils/get-port', () => ({
   getPort: vi.fn().mockResolvedValue(3000),
 }));
 
-import { getStepFunction } from '../private.js';
+import { loadStepFunction } from '../private.js';
 import { dehydrateStepError } from '../serialization.js';
 import {
   getErrorName,
@@ -244,7 +244,7 @@ describe('step-handler 409 handling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Re-set mocks after clearAllMocks
-    vi.mocked(getStepFunction).mockReturnValue(mockStepFn);
+    vi.mocked(loadStepFunction).mockResolvedValue(mockStepFn);
     vi.mocked(normalizeUnknownError).mockImplementation(
       async (err: unknown) => ({
         message: err instanceof Error ? err.message : String(err),
@@ -575,7 +575,7 @@ describe('step-handler 409 handling', () => {
 describe('step-handler max deliveries', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(getStepFunction).mockReturnValue(mockStepFn);
+    vi.mocked(loadStepFunction).mockResolvedValue(mockStepFn);
     mockStepFn.mockReset().mockResolvedValue('step-result');
     mockStepFn.maxRetries = 3;
     mockQueueMessage.mockResolvedValue(undefined);
@@ -684,7 +684,7 @@ describe('step-handler step not found', () => {
   });
 
   it('should fail the step (not the run) when step function is not found', async () => {
-    vi.mocked(getStepFunction).mockReturnValue(undefined);
+    vi.mocked(loadStepFunction).mockResolvedValue(undefined);
 
     const result = await capturedHandler(
       createMessage(),
@@ -729,8 +729,10 @@ describe('step-handler step not found', () => {
   });
 
   it('should fail the step when step function is not a function', async () => {
-    vi.mocked(getStepFunction).mockReturnValue(
-      'not-a-function' as unknown as ReturnType<typeof getStepFunction>
+    vi.mocked(loadStepFunction).mockResolvedValue(
+      'not-a-function' as unknown as Awaited<
+        ReturnType<typeof loadStepFunction>
+      >
     );
 
     const result = await capturedHandler(
@@ -756,8 +758,46 @@ describe('step-handler step not found', () => {
     expect(mockQueueMessage).toHaveBeenCalled();
   });
 
+  it('should fail the step when loading the step module throws', async () => {
+    vi.mocked(loadStepFunction).mockRejectedValue(
+      new Error('Could not load the "sharp" module using the linux-x64 runtime')
+    );
+
+    const result = await capturedHandler(
+      createMessage(),
+      createMetadata('imageStep')
+    );
+
+    expect(result).toBeUndefined();
+    expect(mockEventsCreate).toHaveBeenCalledWith(
+      'wrun_test123',
+      expect.objectContaining({
+        eventType: 'step_started',
+        correlationId: 'step_abc',
+        eventData: expect.objectContaining({
+          stepName: 'imageStep',
+        }),
+      }),
+      expect.anything()
+    );
+    expect(mockEventsCreate).toHaveBeenCalledWith(
+      'wrun_test123',
+      expect.objectContaining({
+        eventType: 'step_failed',
+        correlationId: 'step_abc',
+        eventData: expect.objectContaining({
+          stepName: 'imageStep',
+          error: expect.any(Uint8Array),
+        }),
+      }),
+      expect.anything()
+    );
+    expect(mockQueueMessage).toHaveBeenCalled();
+    expect(mockStepFn).not.toHaveBeenCalled();
+  });
+
   it('should handle EntityConflictError when failing step for missing function', async () => {
-    vi.mocked(getStepFunction).mockReturnValue(undefined);
+    vi.mocked(loadStepFunction).mockResolvedValue(undefined);
     let callCount = 0;
     mockEventsCreate.mockImplementation(
       (_runId: string, event: { eventType: string }) => {
@@ -820,7 +860,7 @@ describe('step-handler step not found', () => {
 describe('step-handler fatal vs retryable behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(getStepFunction).mockReturnValue(mockStepFn);
+    vi.mocked(loadStepFunction).mockResolvedValue(mockStepFn);
     vi.mocked(normalizeUnknownError).mockImplementation(
       async (err: unknown) => ({
         message: err instanceof Error ? err.message : String(err),
@@ -957,7 +997,7 @@ describe('step-handler fatal vs retryable behavior', () => {
 describe('executeStep inline-delta threading', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(getStepFunction).mockReturnValue(mockStepFn);
+    vi.mocked(loadStepFunction).mockResolvedValue(mockStepFn);
     vi.mocked(normalizeUnknownError).mockImplementation(
       async (err: unknown) => ({
         message: err instanceof Error ? err.message : String(err),
@@ -1208,7 +1248,7 @@ describe('executeStep optimistic inline start', () => {
     // Optimistic start is OFF by default — explicitly enable it so these tests
     // exercise the optimistic path. (The disabled-path test overrides to '0'.)
     process.env.WORKFLOW_OPTIMISTIC_INLINE_START = '1';
-    vi.mocked(getStepFunction).mockReturnValue(mockStepFn);
+    vi.mocked(loadStepFunction).mockResolvedValue(mockStepFn);
     vi.mocked(normalizeUnknownError).mockImplementation(
       async (err: unknown) => ({
         message: err instanceof Error ? err.message : String(err),
