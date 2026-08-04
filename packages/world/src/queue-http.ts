@@ -7,29 +7,43 @@ import {
 } from './queue.js';
 
 /**
- * JSON codec for queue message bodies. Preserves Uint8Array values (e.g.
- * workflow run inputs) via a tagged base64 envelope so binary data survives
- * JSON transports.
+ * JSON replacer/reviver preserving Uint8Array values via a tagged base64
+ * envelope ({ __type: 'Uint8Array', data: '<base64>' }) so binary data (e.g.
+ * workflow run inputs) survives JSON transports and storage.
  */
+export function jsonReplacer(_key: string, value: unknown): unknown {
+  if (value instanceof Uint8Array) {
+    return {
+      __type: 'Uint8Array',
+      data: Buffer.from(value).toString('base64'),
+    };
+  }
+  return value;
+}
+
+export function jsonReviver(_key: string, value: unknown): unknown {
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    (value as any).__type === 'Uint8Array' &&
+    typeof (value as any).data === 'string'
+  ) {
+    return new Uint8Array(Buffer.from((value as any).data, 'base64'));
+  }
+  return value;
+}
+
+/** JSON codec for queue message bodies, built on the replacer/reviver above. */
 export function serializeQueueMessage(message: unknown): Buffer {
-  return Buffer.from(
-    JSON.stringify(message, (_key, value) =>
-      value instanceof Uint8Array
-        ? { __type: 'Uint8Array', data: Buffer.from(value).toString('base64') }
-        : value
-    )
-  );
+  return Buffer.from(JSON.stringify(message, jsonReplacer));
 }
 
 export function deserializeQueueMessage(data: Uint8Array): unknown {
-  return JSON.parse(Buffer.from(data).toString(), (_key, value) =>
-    value !== null &&
-    typeof value === 'object' &&
-    value.__type === 'Uint8Array' &&
-    typeof value.data === 'string'
-      ? new Uint8Array(Buffer.from(value.data, 'base64'))
-      : value
-  );
+  // View (not copy) the bytes when possible — job payloads can be large.
+  const buffer = Buffer.isBuffer(data)
+    ? data
+    : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return JSON.parse(buffer.toString(), jsonReviver);
 }
 
 const QueueMessageHeaders = z.object({

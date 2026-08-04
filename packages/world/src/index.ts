@@ -83,6 +83,8 @@ export {
 export {
   createFetchQueueHandler,
   deserializeQueueMessage,
+  jsonReplacer,
+  jsonReviver,
   serializeQueueMessage,
 } from './queue-http.js';
 export { reenqueueActiveRuns } from './recovery.js';
