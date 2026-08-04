@@ -35,8 +35,10 @@ const DEFAULT_OUT_DIR = '.nestjs/workflow';
  */
 @Module({})
 export class WorkflowModule implements OnModuleInit, OnModuleDestroy {
-  private static options: WorkflowModuleOptions | null = null;
-  private static outDir: string | null = null;
+  private static config: {
+    options: WorkflowModuleOptions;
+    outDir: string;
+  } | null = null;
 
   /**
    * Configure the WorkflowModule with options.
@@ -57,8 +59,7 @@ export class WorkflowModule implements OnModuleInit, OnModuleDestroy {
     // Configure the controller with the output directory
     configureWorkflowController(outDir);
 
-    WorkflowModule.options = options;
-    WorkflowModule.outDir = outDir;
+    WorkflowModule.config = { options, outDir };
 
     return {
       module: WorkflowModule,
@@ -74,11 +75,10 @@ export class WorkflowModule implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    const options = WorkflowModule.options;
-    const outDir = WorkflowModule.outDir;
-    if (!options || !outDir) {
+    if (!WorkflowModule.config) {
       return;
     }
+    const { options, outDir } = WorkflowModule.config;
     if (!options.skipBuild) {
       // Lazy-load the toolchain so it never enters the runtime bundle.
       const [{ NestLocalBuilder }, { createBuildQueue }] = await Promise.all([
@@ -97,6 +97,6 @@ export class WorkflowModule implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy() {
     // Cleanup if needed
-    WorkflowModule.options = null;
+    WorkflowModule.config = null;
   }
 }

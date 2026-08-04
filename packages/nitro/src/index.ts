@@ -484,13 +484,20 @@ function addVirtualHandler(
     'workflow/webhook.mjs': '',
     'workflow/workflows.mjs': /* js */ `
       (async () => {
+        let lastError;
         for (let attempt = 0; attempt < 60; attempt++) {
           try {
             await loadPOST();
             return;
-          } catch {}
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          } catch (error) {
+            lastError = error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500).unref?.());
         }
+        console.warn(
+          '[workflow/nitro] Could not load the workflow flow bundle at boot; the queue handler is not registered:',
+          lastError
+        );
       })();`,
   };
 
