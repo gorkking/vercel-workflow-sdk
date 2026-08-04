@@ -82,11 +82,11 @@ const world = createWorld({
 await world.start();
 ```
 
-Use this option only when your application or framework has its own shutdown hook. Handle cleanup errors there and await `world.close()` first, then close the workflow HTTP server and any caller-owned `pg.Pool`.
+Use this option only when your application or framework has its own shutdown hook. Handle cleanup errors there and await `world.close()` first, then close any caller-owned `pg.Pool`.
 
-Closing the world stops the queue from accepting new jobs and waits for active jobs. After Graphile Worker's graceful-shutdown timeout (5 seconds by default), it aborts any workflow HTTP request that is still pending. Graphile Worker then unlocks the same row through its normal failure handling. Graphile counts a delivery attempt when it claims the row, so the aborted delivery consumes that attempt and is retried only if its Graphile attempt budget remains. A one-attempt or final-attempt job is unlocked but not retried. The shutdown handler does not create a replacement row.
+Closing the world stops the queue from accepting new jobs and waits for active jobs. After Graphile Worker's graceful-shutdown timeout (5 seconds by default), it unlocks any job row that is still executing through its normal failure handling. Graphile counts a delivery attempt when it claims the row, so the interrupted delivery consumes that attempt and is retried only if its Graphile attempt budget remains. A one-attempt or final-attempt job is unlocked but not retried. The shutdown handler does not create a replacement row.
 
-An aborted HTTP request does not guarantee that its server-side handler stopped, so workflow and step handlers must continue to tolerate at-least-once execution. Keep the workflow HTTP routes and any caller-owned pool available until `world.close()` resolves.
+An unlocked job row does not stop the in-process handler that is still executing it, so workflow and step handlers must continue to tolerate at-least-once execution. Keep any caller-owned pool available until `world.close()` resolves.
 
 ## Configuration Options
 
@@ -176,18 +176,25 @@ and its token can be reused. If the token is never reused, the expired
 ## Features
 
 - **Durable Storage**: Stores workflow runs, events, steps, hooks, and webhooks in PostgreSQL
-- **Queue Processing**: Uses graphile-worker as the durable queue and executes jobs over the workflow HTTP routes
+- **Queue Processing**: Uses graphile-worker as the durable queue and executes jobs in-process through the registered workflow handler — no HTTP loopback
 - **Durable Delays**: Re-schedules waits and retries in PostgreSQL
 - **Streaming**: Real-time event streaming capabilities
 - **Health Checks**: Built-in connection health monitoring
 - **Configurable Concurrency**: Adjustable worker concurrency for queue processing
+
+## Execution Model
+
+A worker is any Node.js process that has loaded the generated workflow route module (which registers the workflow handler) and called `world.start()`. Jobs are executed by calling that handler directly in-process — there is no HTTP hop. Scale out by running more such processes against the same database; graphile-worker's row locking distributes jobs between them.
+
+- `world.start()` starts consuming jobs only once a workflow handler is registered. If none is registered after 10 seconds, a warning is logged.
+- A process that only enqueues runs (e.g. a CLI) never registers a handler, so it never consumes jobs — they stay in PostgreSQL until a worker picks them up.
 
 ## Queue Behavior
 
 - Graphile jobs are acknowledged only after execution finishes, or after the worker durably schedules a delayed follow-up job
 - Backlog stays in PostgreSQL when all execution slots are busy
 - Retry and sleep-style delays use Graphile `runAt` scheduling
-- Workflow orchestration and queued step execution are both sent through `/.well-known/workflow/v1/flow`
+- Workflow orchestration and queued step execution are both dispatched through the single registered workflow queue handler
 
 ## Development
 

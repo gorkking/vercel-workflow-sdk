@@ -1,4 +1,3 @@
-import { getWorkflowPort } from '@workflow/utils/get-port';
 import { makeWorkerUtils, run, type WorkerUtils } from 'graphile-worker';
 import { Pool } from 'pg';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,10 +25,6 @@ vi.mock('pg', () => ({
       end: vi.fn(),
     };
   }),
-}));
-
-vi.mock('@workflow/utils/get-port', () => ({
-  getWorkflowPort: vi.fn(),
 }));
 
 vi.mock('./storage.js', () => ({
@@ -93,7 +88,6 @@ describe('re-enqueue active runs on start', () => {
     vi.clearAllMocks();
     runnerMock.promise = Promise.resolve();
     vi.mocked(makeWorkerUtils).mockResolvedValue(workerUtilsMock);
-    vi.mocked(getWorkflowPort).mockResolvedValue(undefined);
     vi.mocked(run).mockResolvedValue(runnerMock as any);
     vi.mocked(createEventsStorage).mockReturnValue({} as any);
     vi.mocked(createHooksStorage).mockReturnValue({} as any);
@@ -142,6 +136,7 @@ describe('re-enqueue active runs on start', () => {
 
   it('keeps automatic shutdown in createWorld() by default', async () => {
     const world = createWorld();
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     expect(run).toHaveBeenCalledWith(
@@ -155,6 +150,7 @@ describe('re-enqueue active runs on start', () => {
     process.env.WORKFLOW_POSTGRES_APPLICATION_MANAGED_SHUTDOWN = '1';
 
     const world = createWorld();
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     expect(run).toHaveBeenCalledWith(
@@ -171,6 +167,7 @@ describe('re-enqueue active runs on start', () => {
     });
 
     const world = createWorld({ connectionString: 'postgres://test', pool });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     expect(workerUtilsMock.addJob).toHaveBeenCalledTimes(2);
@@ -192,6 +189,7 @@ describe('re-enqueue active runs on start', () => {
     mockRunsList({});
 
     const world = createWorld({ connectionString: 'postgres://test', pool });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     // addJob should only have been called for pgboss migration check, not for
@@ -227,6 +225,7 @@ describe('re-enqueue active runs on start', () => {
     } as any);
 
     const world = createWorld({ connectionString: 'postgres://test', pool });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     // Should have 4 list calls: 2 statuses × 2 pages each
@@ -245,6 +244,7 @@ describe('re-enqueue active runs on start', () => {
       resolveRunnerFinished = resolve;
     });
     const world = createWorld({ connectionString: 'postgres://test' });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
     const streamer = vi.mocked(createStreamer).mock.results.at(-1)?.value;
     const internalPool = vi.mocked(Pool).mock.results.at(-1)?.value;
@@ -282,6 +282,7 @@ describe('re-enqueue active runs on start', () => {
       resolveRunnerFinished = resolve;
     });
     const world = createWorld({ connectionString: 'postgres://test' });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     const closePromise = world.close();
@@ -303,6 +304,7 @@ describe('re-enqueue active runs on start', () => {
       rejectRunnerFinished = reject;
     });
     const world = createWorld({ connectionString: 'postgres://test' });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
     const streamer = vi.mocked(createStreamer).mock.results.at(-1)?.value;
     const internalPool = vi.mocked(Pool).mock.results.at(-1)?.value;
@@ -324,6 +326,7 @@ describe('re-enqueue active runs on start', () => {
       .mockRejectedValueOnce(new Error('transient release error'))
       .mockResolvedValueOnce(undefined);
     const world = createWorld({ connectionString: 'postgres://test' });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
     const streamer = vi.mocked(createStreamer).mock.results.at(-1)?.value;
     const internalPool = vi.mocked(Pool).mock.results.at(-1)?.value;
@@ -341,6 +344,7 @@ describe('re-enqueue active runs on start', () => {
 
   it('does not close a caller-owned pool', async () => {
     const world = createWorld({ pool });
+    world.createQueueHandler('__wkf_workflow_', async () => undefined);
     await world.start();
 
     await world.close();

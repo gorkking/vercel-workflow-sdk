@@ -1,10 +1,14 @@
 import fs from 'node:fs';
 import { serve } from '@hono/node-server';
+import { createWorld } from '@workflow/core/runtime';
+import {
+  HealthCheckPayloadSchema,
+  WorkflowInvokePayloadSchema,
+} from '@workflow/world';
 import { Hono } from 'hono';
 import { getHookByToken, getRun, resumeHook, start } from 'workflow/api';
-import { getWorld } from 'workflow/runtime';
+import { getWorld, setWorld } from 'workflow/runtime';
 import * as z from 'zod';
-import { POST as flowPOST } from '../.well-known/workflow/v1/flow.mjs';
 import manifest from '../.well-known/workflow/v1/manifest.json' with {
   type: 'json',
 };
@@ -15,6 +19,28 @@ if (!process.env.WORKFLOW_TARGET_WORLD) {
   );
   process.exit(1);
 }
+
+// Track flow handler invocations per run for testing inline execution. The
+// counting wraps createQueueHandler (not the HTTP route) because worlds like
+// @workflow/world-postgres execute queue messages in-process without HTTP.
+const flowInvocationCounts = new Map<string, number>();
+
+const world = await createWorld();
+const createQueueHandler = world.createQueueHandler.bind(world);
+world.createQueueHandler = (prefix, handler) =>
+  createQueueHandler(prefix, async (message, metadata) => {
+    if (!HealthCheckPayloadSchema.safeParse(message).success) {
+      const { runId } = WorkflowInvokePayloadSchema.parse(message);
+      flowInvocationCounts.set(
+        runId,
+        (flowInvocationCounts.get(runId) ?? 0) + 1
+      );
+    }
+    return handler(message, metadata);
+  });
+setWorld(world);
+
+const { POST: flowPOST } = await import('../.well-known/workflow/v1/flow.mjs');
 
 type Files = keyof typeof manifest.workflows;
 type Workflows<F extends Files> = keyof (typeof manifest.workflows)[F];
@@ -41,38 +67,8 @@ const Invoke = z
     };
   });
 
-// Track flow handler invocations per run for testing inline execution
-const flowInvocationCounts = new Map<string, number>();
-
 const app = new Hono()
-  .post('/.well-known/workflow/v1/flow', async (ctx) => {
-    // Clone the request to read the body for tracking without consuming it.
-    // We must increment the invocation counter *before* awaiting flowPOST,
-    // otherwise the workflow may complete (and the test may observe the
-    // completed status) before the counter is bumped, producing a flaky
-    // `expected 0 to be 1` failure when the test immediately queries
-    // /_flow-invocations after seeing the run as completed.
-    const cloned = ctx.req.raw.clone();
-    try {
-      const body = (await cloned.json()) as Record<string, unknown>;
-      const runId =
-        typeof body?.runId === 'string'
-          ? body.runId
-          : typeof (body.payload as Record<string, unknown> | undefined)
-                ?.runId === 'string'
-            ? ((body.payload as Record<string, unknown>).runId as string)
-            : undefined;
-      if (runId) {
-        flowInvocationCounts.set(
-          runId,
-          (flowInvocationCounts.get(runId) ?? 0) + 1
-        );
-      }
-    } catch {
-      // Health check or non-JSON messages — ignore
-    }
-    return flowPOST(ctx.req.raw);
-  })
+  .post('/.well-known/workflow/v1/flow', (ctx) => flowPOST(ctx.req.raw))
   .get('/_flow-invocations/:runId', (ctx) => {
     const count = flowInvocationCounts.get(ctx.req.param('runId')) ?? 0;
     return ctx.json({ count });

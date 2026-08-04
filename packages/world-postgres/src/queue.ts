@@ -1,11 +1,3 @@
-import { connect } from 'node:net';
-import { setTimeout as sleep } from 'node:timers/promises';
-import {
-  createWorkflowBaseUrl,
-  createWorkflowHealthEndpoint,
-  createWorkflowUrl,
-} from '@workflow/utils';
-import { getWorkflowPort } from '@workflow/utils/get-port';
 import {
   createFetchQueueHandler,
   deserializeQueueMessage,
@@ -13,6 +5,7 @@ import {
   MessageId,
   parseQueueName,
   type Queue,
+  type QueueHandler,
   QueuePayloadSchema,
   type QueuePrefix,
   resolveQueueNamespace,
@@ -53,28 +46,46 @@ function createGraphileLogger() {
 
 const graphileLogger = createGraphileLogger();
 const COMPLETED_IDEMPOTENCY_CACHE_LIMIT = 10_000;
+const HANDLER_WAIT_WARNING_MS = 10_000;
 const GraphileHelpers = z.object({
-  abortSignal: z.instanceof(AbortSignal).optional(),
   job: z.object({
     attempts: z.number().int().positive(),
   }),
 });
 
-type HttpExecutionResult =
-  | { type: 'completed' }
-  | { type: 'reschedule'; timeoutSeconds: number }
-  | {
-      type: 'error';
-      status: number;
-      text: string;
-      headers: Record<string, string>;
-    };
-
-type RunnerStart = { controller: AbortController; promise: Promise<void> };
-type LoopbackTarget = { hosts: string[]; port: number };
+/**
+ * Queue handlers registered by the workflow runtime, keyed by queue prefix.
+ * Held on globalThis so every copy of this module in the process (e.g. one
+ * bundled into a route module and one loaded by instrumentation) shares a
+ * single registry. The latest registration for a prefix wins, so a reloaded
+ * route module (dev) replaces its predecessor.
+ */
+type HandlerRegistry = {
+  handlers: Map<QueuePrefix, QueueHandler>;
+  onRegister: Set<() => void>;
+};
+const RegistryKey = Symbol.for('@workflow/world-postgres//queueHandlers');
+const globalScope = globalThis as { [RegistryKey]?: HandlerRegistry };
+const registry: HandlerRegistry = globalScope[RegistryKey] ?? {
+  handlers: new Map(),
+  onRegister: new Set(),
+};
+globalScope[RegistryKey] = registry;
 
 /**
- * The Postgres queue stores messages under one graphile-worker flow task.
+ * Registers the runtime's queue handler for direct in-process execution by
+ * the embedded graphile-worker runner, and returns the standard HTTP wrapper
+ * for the generated flow route.
+ */
+const createQueueHandler: Queue['createQueueHandler'] = (prefix, handler) => {
+  registry.handlers.set(prefix, handler);
+  for (const notify of [...registry.onRegister]) notify();
+  return createFetchQueueHandler(prefix, handler);
+};
+
+/**
+ * The Postgres queue stores messages under one graphile-worker flow task and
+ * executes them by calling the registered in-process queue handler directly.
  */
 export type PostgresQueue = Queue & {
   start(): Promise<void>;
@@ -85,17 +96,12 @@ export function createQueue(
   config: PostgresWorldConfig,
   pool: Pool
 ): PostgresQueue {
-  const port = process.env.PORT ? Number(process.env.PORT) : undefined;
   const generateMessageId = monotonicFactory();
-
-  function getJobQueueName(): string {
-    const jobPrefix = config.jobPrefix || 'workflow_';
-    return `${jobPrefix}flows`;
-  }
-
-  const getDeploymentId: Queue['getDeploymentId'] = async () => {
-    return 'postgres';
-  };
+  const jobQueueName = `${config.jobPrefix || 'workflow_'}flows`;
+  const workflowPrefix = getQueueTopicPrefix(
+    'workflow',
+    resolveQueueNamespace(config.namespace)
+  );
 
   const completedMessages = new Set<string>();
   const inflightMessages = new Map<string, Promise<void>>();
@@ -103,11 +109,27 @@ export function createQueue(
     string,
     Promise<'completed' | 'rescheduled'>
   >();
-  let workerUtils: WorkerUtils | null = null;
+  let workerUtilsPromise: Promise<WorkerUtils> | null = null;
+  let runnerPromise: Promise<void> | null = null;
   let runner: Runner | null = null;
-  let runnerStart: RunnerStart | null = null;
-  let closing = false;
-  let startPromise: Promise<void> | null = null;
+  let closed = false;
+  const closeController = new AbortController();
+
+  function ensureWorkerUtils(): Promise<WorkerUtils> {
+    workerUtilsPromise ??= (async () => {
+      const utils = await makeWorkerUtils({
+        pgPool: pool,
+        logger: graphileLogger,
+      });
+      await utils.migrate();
+      await migratePgBossJobs(utils);
+      return utils;
+    })().catch((err) => {
+      workerUtilsPromise = null;
+      throw err;
+    });
+    return workerUtilsPromise;
+  }
 
   function markMessageCompleted(idempotencyKey: string) {
     completedMessages.delete(idempotencyKey);
@@ -137,20 +159,16 @@ export function createQueue(
     idempotencyKey?: string;
     headers?: Record<string, string>;
     delaySeconds?: number;
-    jobKey?: string;
+    jobKey: string;
   }) {
-    const utils = workerUtils;
-    if (!utils) {
-      throw new Error('Postgres queue worker utils are not initialized');
-    }
-
+    const utils = await ensureWorkerUtils();
     const runAt =
       typeof delaySeconds === 'number' && delaySeconds > 0
         ? new Date(Date.now() + delaySeconds * 1000)
         : undefined;
 
     await utils.addJob(
-      getJobQueueName(),
+      jobQueueName,
       MessageData.encode({
         id: queueId,
         data: Buffer.from(body),
@@ -160,185 +178,11 @@ export function createQueue(
         headers,
       }),
       {
-        ...(jobKey ? { jobKey } : {}),
+        jobKey,
         ...(runAt ? { runAt } : {}),
         maxAttempts: 3,
       }
     );
-  }
-
-  async function getExecutionBaseUrl(): Promise<string | undefined> {
-    if (process.env.WORKFLOW_LOCAL_BASE_URL) {
-      return process.env.WORKFLOW_LOCAL_BASE_URL;
-    }
-
-    if (typeof port === 'number') {
-      return createWorkflowBaseUrl(`http://localhost:${port}`);
-    }
-
-    if (process.env.PORT) {
-      return createWorkflowBaseUrl(`http://localhost:${process.env.PORT}`);
-    }
-
-    const detectedPort = await getWorkflowPort({
-      endpoint: createWorkflowHealthEndpoint(),
-    });
-    if (typeof detectedPort === 'number') {
-      return createWorkflowBaseUrl(`http://localhost:${detectedPort}`);
-    }
-
-    return undefined;
-  }
-
-  function getLoopbackHosts(hostname: string): string[] {
-    if (hostname === 'localhost') {
-      return ['127.0.0.1', '::1'];
-    }
-    if (hostname === '[::1]') {
-      return ['::1'];
-    }
-    return hostname === '127.0.0.1' || hostname === '::1' ? [hostname] : [];
-  }
-
-  function getLoopbackTarget(baseUrl: string | undefined) {
-    if (!baseUrl) {
-      return undefined;
-    }
-
-    const url = new URL(baseUrl);
-    const hosts = getLoopbackHosts(url.hostname);
-    if (hosts.length === 0) {
-      return undefined;
-    }
-
-    return {
-      hosts,
-      port: Number(url.port || (url.protocol === 'https:' ? 443 : 80)),
-    };
-  }
-
-  async function canConnectToLoopbackTarget(
-    target: LoopbackTarget
-  ): Promise<boolean> {
-    for (const host of target.hosts) {
-      const reachable = await new Promise<boolean>((resolve) => {
-        const socket = connect({ host, port: target.port });
-        socket.unref();
-        const finish = (isReachable: boolean) => {
-          socket.destroy();
-          resolve(isReachable);
-        };
-
-        socket.setTimeout(200, () => finish(false));
-        socket.once('connect', () => finish(true));
-        socket.once('error', () => finish(false));
-      });
-
-      if (reachable) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  async function startRunnerUnlessAborted(controller: AbortController) {
-    if (controller.signal.aborted) {
-      return;
-    }
-
-    await setupListeners();
-  }
-
-  async function waitForLoopbackAndStartRunner(
-    controller: AbortController,
-    target: LoopbackTarget
-  ) {
-    while (
-      !controller.signal.aborted &&
-      !(await canConnectToLoopbackTarget(target))
-    ) {
-      await sleep(50, undefined, {
-        ref: false,
-      });
-    }
-
-    await startRunnerUnlessAborted(controller);
-  }
-
-  function deferRunnerStart(
-    controller: AbortController,
-    target: LoopbackTarget
-  ) {
-    const promise = waitForLoopbackAndStartRunner(controller, target)
-      .catch((err) => {
-        if (!controller.signal.aborted) {
-          console.warn(
-            '[world-postgres] Failed to start Graphile Worker after local workflow executor became reachable:',
-            err
-          );
-        }
-      })
-      .finally(() => {
-        if (runnerStart?.promise === promise) {
-          runnerStart = null;
-        }
-      });
-    runnerStart = { controller, promise };
-  }
-
-  async function executeMessageOverHttp({
-    queueName,
-    messageId,
-    attempt,
-    body,
-    headers: extraHeaders,
-    abortSignal,
-  }: {
-    queueName: ValidQueueName;
-    messageId: MessageId;
-    attempt: number;
-    body: Uint8Array;
-    headers?: Record<string, string>;
-    abortSignal?: AbortSignal;
-  }): Promise<HttpExecutionResult> {
-    const headers: Record<string, string> = {
-      ...extraHeaders,
-      'content-type': 'application/json',
-      'x-vqs-queue-name': queueName,
-      'x-vqs-message-id': messageId,
-      'x-vqs-message-attempt': String(attempt),
-    };
-    const baseUrl = await getExecutionBaseUrl();
-    if (!baseUrl) {
-      throw new Error('Unable to resolve base URL for workflow queue.');
-    }
-    const response = await fetch(createWorkflowUrl(baseUrl, { type: 'flow' }), {
-      method: 'POST',
-      duplex: 'half',
-      headers,
-      body,
-      signal: abortSignal,
-    } as any);
-    const text = await response.text();
-
-    if (!response.ok) {
-      return {
-        type: 'error',
-        status: response.status,
-        text,
-        headers: Object.fromEntries(response.headers.entries()),
-      };
-    }
-
-    try {
-      const timeoutSeconds = Number(JSON.parse(text).timeoutSeconds);
-      if (Number.isFinite(timeoutSeconds) && timeoutSeconds >= 0) {
-        return { type: 'reschedule', timeoutSeconds };
-      }
-    } catch {}
-
-    return { type: 'completed' };
   }
 
   async function migratePgBossJobs(utils: WorkerUtils): Promise<void> {
@@ -388,73 +232,81 @@ export function createQueue(
     }
   }
 
-  async function startRunnerWhenExecutorIsReady(): Promise<void> {
-    if (closing || runner || runnerStart) {
-      return;
-    }
+  /** Resolves once a handler for this queue's prefix is registered, or on close. */
+  function waitForHandler(): Promise<void> {
+    if (registry.handlers.has(workflowPrefix)) return Promise.resolve();
 
-    const controller = new AbortController();
-    const promise = (async () => {
-      const target = getLoopbackTarget(await getExecutionBaseUrl());
-      if (!target) {
-        await startRunnerUnlessAborted(controller);
-        return;
-      }
+    const warnTimer = setTimeout(() => {
+      console.warn(
+        `[world-postgres] Waiting for a workflow handler for "${workflowPrefix}" before consuming queue jobs. ` +
+          'Import the generated workflow route module in this process so it can register its handler.'
+      );
+    }, HANDLER_WAIT_WARNING_MS);
+    warnTimer.unref();
 
-      if (await canConnectToLoopbackTarget(target)) {
-        await startRunnerUnlessAborted(controller);
-        return;
-      }
-
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      deferRunnerStart(controller, target);
-    })().finally(() => {
-      if (runnerStart?.promise === promise) {
-        runnerStart = null;
-      }
+    return new Promise((resolve) => {
+      const check = () => {
+        if (
+          !registry.handlers.has(workflowPrefix) &&
+          !closeController.signal.aborted
+        ) {
+          return;
+        }
+        registry.onRegister.delete(check);
+        clearTimeout(warnTimer);
+        resolve();
+      };
+      registry.onRegister.add(check);
+      closeController.signal.addEventListener('abort', check, { once: true });
     });
-    runnerStart = { controller, promise };
-    await promise;
   }
 
   async function start(): Promise<void> {
-    if (closing) {
-      return;
-    }
+    if (closed) return;
+    await ensureWorkerUtils();
 
-    if (!startPromise) {
-      startPromise = (async () => {
-        try {
-          workerUtils = await makeWorkerUtils({
-            pgPool: pool,
-            logger: graphileLogger,
-          });
-          await workerUtils.migrate();
-          await migratePgBossJobs(workerUtils);
-          await startRunnerWhenExecutorIsReady();
-        } catch (err) {
-          startPromise = null;
-          throw err;
-        }
+    // The runner starts only once a workflow handler is registered: jobs stay
+    // in Postgres until this process can execute them, and are never consumed
+    // by an enqueue-only process. Armed in the background so start() does not
+    // block boot when the route module loads after instrumentation.
+    if (!runnerPromise) {
+      runnerPromise = (async () => {
+        await waitForHandler();
+        if (closed) return;
+        runner = await run({
+          pgPool: pool,
+          // Default of 50 is high enough to avoid worker-pool exhaustion in
+          // workflows that use parent→child polling patterns (e.g. awaiting a
+          // child workflow via `childRun.returnValue` inside the parent).
+          // Every such poll holds a worker slot for the duration of the child
+          // run. See packages/core/src/runtime/run.ts and
+          // docs/content/docs/changelog/eager-processing.mdx for context.
+          concurrency: config.queueConcurrency || 50,
+          logger: graphileLogger,
+          ...(config.applicationManagedShutdown === true && {
+            noHandleSignals: true,
+          }),
+          pollInterval: 500, // graphile-worker uses LISTEN/NOTIFY when available
+          taskList: { [jobQueueName]: handleFlowJob },
+        });
       })();
+      runnerPromise.catch((err) => {
+        runnerPromise = null;
+        console.error('[world-postgres] Queue runner failed to start:', err);
+      });
     }
-    await startPromise;
-    if (!closing && !runner && !runnerStart) {
-      await startRunnerWhenExecutorIsReady();
+    if (registry.handlers.has(workflowPrefix)) {
+      await runnerPromise;
     }
   }
 
-  const queue: Queue['queue'] = async (queue, message, opts) => {
-    await start();
-    const { id: queueId } = parseQueueName(queue);
-    const body = serializeQueueMessage(message);
+  const queue: Queue['queue'] = async (queueName, message, opts) => {
+    if (closed) throw new Error('[world-postgres] The queue is closed');
+    const { id: queueId } = parseQueueName(queueName);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     await addGraphileJob({
       queueId,
-      body,
+      body: serializeQueueMessage(message),
       messageId,
       attempt: 1,
       idempotencyKey: opts?.idempotencyKey,
@@ -465,157 +317,121 @@ export function createQueue(
     return { messageId };
   };
 
-  function createTaskHandler(queue: QueuePrefix) {
-    return async (payload: unknown, helpers: unknown) => {
-      const messageData = MessageData.parse(payload);
-      const graphileHelpers = GraphileHelpers.safeParse(helpers);
-      const attempt = graphileHelpers.success
-        ? graphileHelpers.data.job.attempts
-        : messageData.attempt;
-      const queueName = `${queue}${messageData.id}` as ValidQueueName;
-      const body = deserializeQueueMessage(messageData.data);
-      QueuePayloadSchema.parse(body);
-      const workflowInvoke = WorkflowInvokePayloadSchema.safeParse(body);
-      const workflowRunSerializationKey =
-        workflowInvoke.success && !workflowInvoke.data.stepId
-          ? `workflow:${workflowInvoke.data.runId}`
-          : undefined;
-      const executeTask = async (): Promise<'completed' | 'rescheduled'> => {
-        const result = await executeMessageOverHttp({
-          queueName,
-          messageId: messageData.messageId,
-          attempt,
-          body: messageData.data,
-          headers: messageData.headers,
-          abortSignal: graphileHelpers.success
-            ? graphileHelpers.data.abortSignal
-            : undefined,
-        });
+  async function handleFlowJob(
+    payload: unknown,
+    helpers: unknown
+  ): Promise<void> {
+    const messageData = MessageData.parse(payload);
+    const graphileHelpers = GraphileHelpers.safeParse(helpers);
+    // messageData.attempt is the first logical delivery this graphile job
+    // represents; graphile's own `attempts` counts retries of this job. Their
+    // sum survives timeoutSeconds reschedules, which create replacement jobs.
+    const attempt =
+      messageData.attempt +
+      (graphileHelpers.success ? graphileHelpers.data.job.attempts - 1 : 0);
+    const queueName = `${workflowPrefix}${messageData.id}` as ValidQueueName;
+    const message = deserializeQueueMessage(messageData.data);
+    QueuePayloadSchema.parse(message);
+    const workflowInvoke = WorkflowInvokePayloadSchema.safeParse(message);
+    const workflowRunSerializationKey =
+      workflowInvoke.success && !workflowInvoke.data.stepId
+        ? `workflow:${workflowInvoke.data.runId}`
+        : undefined;
 
-        if (result.type === 'completed') {
-          return 'completed';
-        }
-
-        if (result.type === 'reschedule') {
-          // Schedule the follow-up job before we return so a crash cannot
-          // lose the wake-up request.
-          await addGraphileJob({
-            queueId: messageData.id,
-            body: messageData.data,
-            messageId: messageData.messageId,
-            attempt: attempt + 1,
-            idempotencyKey: messageData.idempotencyKey,
-            headers: messageData.headers,
-            delaySeconds: result.timeoutSeconds,
-            jobKey: messageData.idempotencyKey ?? messageData.messageId,
-          });
-          return 'rescheduled';
-        }
-
+    const executeTask = async (): Promise<'completed' | 'rescheduled'> => {
+      const handler = registry.handlers.get(workflowPrefix);
+      if (!handler) {
+        // The runner only starts after registration; throwing hands the job
+        // back to graphile for redelivery.
         throw new Error(
-          `[postgres world] Queue execution failed (${result.status}): ${result.text}`
+          `[world-postgres] No workflow handler registered for "${workflowPrefix}"`
         );
-      };
-
-      const idempotencyKey = messageData.idempotencyKey;
-      if (!idempotencyKey) {
-        if (workflowRunSerializationKey) {
-          // Preserve step fan-out while preventing two workflow replays from
-          // mutating the same run's event log at the same time.
-          const previous = inflightWorkflowRuns.get(
-            workflowRunSerializationKey
-          );
-          const execution = (previous ?? Promise.resolve())
-            .catch(() => {})
-            .then(() => executeTask())
-            .finally(() => {
-              if (
-                inflightWorkflowRuns.get(workflowRunSerializationKey) ===
-                execution
-              ) {
-                inflightWorkflowRuns.delete(workflowRunSerializationKey);
-              }
-            });
-          inflightWorkflowRuns.set(workflowRunSerializationKey, execution);
-          await execution;
-          return;
-        }
-
-        await executeTask();
-        return;
       }
 
-      if (completedMessages.has(idempotencyKey)) {
-        return;
-      }
-
-      const existing = inflightMessages.get(idempotencyKey);
-      if (existing) {
-        await existing;
-        return;
-      }
-
-      const execution = executeTask()
-        .then((result) => {
-          if (result === 'completed') {
-            markMessageCompleted(idempotencyKey);
-          }
-        })
-        .finally(() => {
-          inflightMessages.delete(idempotencyKey);
+      const result = await handler(message, {
+        attempt,
+        queueName,
+        messageId: messageData.messageId,
+      });
+      if (result) {
+        // Schedule the follow-up job before we return so a crash cannot
+        // lose the wake-up request.
+        await addGraphileJob({
+          queueId: messageData.id,
+          body: messageData.data,
+          messageId: messageData.messageId,
+          attempt: attempt + 1,
+          idempotencyKey: messageData.idempotencyKey,
+          headers: messageData.headers,
+          delaySeconds: result.timeoutSeconds,
+          jobKey: messageData.idempotencyKey ?? messageData.messageId,
         });
-      inflightMessages.set(idempotencyKey, execution);
-      await execution;
+        return 'rescheduled';
+      }
+      return 'completed';
     };
-  }
 
-  async function setupListeners() {
-    const taskList: Record<
-      string,
-      (payload: unknown, helpers: unknown) => Promise<void>
-    > = {};
-    const namespace = resolveQueueNamespace(config.namespace);
-    const workflowPrefix = getQueueTopicPrefix('workflow', namespace);
-    taskList[getJobQueueName()] = createTaskHandler(workflowPrefix);
+    const idempotencyKey = messageData.idempotencyKey;
+    if (!idempotencyKey) {
+      if (workflowRunSerializationKey) {
+        // Preserve step fan-out while preventing two workflow replays from
+        // mutating the same run's event log at the same time.
+        const previous = inflightWorkflowRuns.get(workflowRunSerializationKey);
+        const execution = (previous ?? Promise.resolve())
+          .catch(() => {})
+          .then(() => executeTask())
+          .finally(() => {
+            if (
+              inflightWorkflowRuns.get(workflowRunSerializationKey) ===
+              execution
+            ) {
+              inflightWorkflowRuns.delete(workflowRunSerializationKey);
+            }
+          });
+        inflightWorkflowRuns.set(workflowRunSerializationKey, execution);
+        await execution;
+        return;
+      }
 
-    runner = await run({
-      pgPool: pool,
-      // Default of 50 is high enough to avoid worker-pool exhaustion in
-      // workflows that use parent→child polling patterns (e.g. awaiting a
-      // child workflow via `childRun.returnValue` inside the parent).
-      // Every such poll holds a worker slot for the duration of the child
-      // run. Recursive workflows like `fibonacciWorkflow` fan out quickly
-      // — fib(6) produces ~24 concurrent polling steps at peak, and at
-      // concurrency=10 (the previous default) it would deadlock on the
-      // default Postgres setup. See packages/core/src/runtime/run.ts and
-      // docs/content/docs/changelog/eager-processing.mdx for context.
-      concurrency: config.queueConcurrency || 50,
-      logger: graphileLogger,
-      ...(config.applicationManagedShutdown === true && {
-        noHandleSignals: true,
-      }),
-      pollInterval: 500, // 500ms = 0.5s (graphile-worker uses LISTEN/NOTIFY when available)
-      taskList,
-    });
+      await executeTask();
+      return;
+    }
+
+    if (completedMessages.has(idempotencyKey)) {
+      return;
+    }
+
+    const existing = inflightMessages.get(idempotencyKey);
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const execution = executeTask()
+      .then((result) => {
+        if (result === 'completed') {
+          markMessageCompleted(idempotencyKey);
+        }
+      })
+      .finally(() => {
+        inflightMessages.delete(idempotencyKey);
+      });
+    inflightMessages.set(idempotencyKey, execution);
+    await execution;
   }
 
   return {
-    createQueueHandler: createFetchQueueHandler,
-    getDeploymentId,
+    createQueueHandler,
+    getDeploymentId: async () => 'postgres',
     queue,
     start,
     async close() {
-      closing = true;
-      if (runnerStart) {
-        runnerStart.controller.abort();
-        await runnerStart.promise;
-        runnerStart = null;
-      }
-      await startPromise?.catch(() => {});
-      const activeRunner = runner;
-      if (activeRunner) {
+      closed = true;
+      closeController.abort();
+      await runnerPromise?.catch(() => {});
+      if (runner) {
         try {
-          await activeRunner.stop();
+          await runner.stop();
         } catch (error) {
           if (
             !(error instanceof Error) ||
@@ -624,14 +440,14 @@ export function createQueue(
             throw error;
           }
         }
-        await activeRunner.promise.catch(() => {});
+        await runner.promise.catch(() => {});
         runner = null;
       }
-      if (workerUtils) {
-        await workerUtils.release();
-        workerUtils = null;
+      if (workerUtilsPromise) {
+        const utils = await workerUtilsPromise.catch(() => null);
+        if (utils) await utils.release();
+        workerUtilsPromise = null;
       }
-      startPromise = null;
     },
   };
 }
