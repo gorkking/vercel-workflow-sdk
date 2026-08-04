@@ -276,6 +276,17 @@ export interface QueueOptions {
   region?: string;
 }
 
+export type QueueHandler = (
+  message: unknown,
+  meta: {
+    attempt: number;
+    queueName: ValidQueueName;
+    messageId: MessageId;
+    requestId?: string;
+  }
+  // biome-ignore lint/suspicious/noConfusingVoidType: it is what it is
+) => Promise<void | { timeoutSeconds: number }>;
+
 export interface Queue {
   getDeploymentId(): Promise<string>;
 
@@ -307,15 +318,6 @@ export interface Queue {
    */
   createQueueHandler(
     queueNamePrefix: QueuePrefix,
-    handler: (
-      message: unknown,
-      meta: {
-        attempt: number;
-        queueName: ValidQueueName;
-        messageId: MessageId;
-        requestId?: string;
-      }
-      // biome-ignore lint/suspicious/noConfusingVoidType: it is what it is
-    ) => Promise<void | { timeoutSeconds: number }>
+    handler: QueueHandler
   ): (req: Request) => Promise<Response>;
 }

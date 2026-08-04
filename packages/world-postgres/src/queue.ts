@@ -1,7 +1,5 @@
 import { connect } from 'node:net';
-import * as Stream from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { Transport } from '@vercel/queue';
 import {
   createWorkflowBaseUrl,
   createWorkflowHealthEndpoint,
@@ -9,6 +7,8 @@ import {
 } from '@workflow/utils';
 import { getWorkflowPort } from '@workflow/utils/get-port';
 import {
+  createFetchQueueHandler,
+  deserializeQueueMessage,
   getQueueTopicPrefix,
   MessageId,
   parseQueueName,
@@ -16,10 +16,10 @@ import {
   QueuePayloadSchema,
   type QueuePrefix,
   resolveQueueNamespace,
+  serializeQueueMessage,
   type ValidQueueName,
   WorkflowInvokePayloadSchema,
 } from '@workflow/world';
-import { createWorld } from '@workflow/world-local';
 import {
   Logger,
   makeWorkerUtils,
@@ -86,49 +86,12 @@ export function createQueue(
   pool: Pool
 ): PostgresQueue {
   const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const localWorld = createWorld({ dataDir: undefined, port });
-
-  // JSON transport that preserves Uint8Array values via a tagged
-  // envelope ({ __type: 'Uint8Array', data: '<base64>' }).  Required
-  // for the resilient start path where runInput.input (a Uint8Array)
-  // is sent through the queue.
-  const transport: Transport<unknown> = {
-    contentType: 'application/json',
-    serialize(value: unknown): Buffer {
-      return Buffer.from(
-        JSON.stringify(value, (_key, v) =>
-          v instanceof Uint8Array
-            ? { __type: 'Uint8Array', data: Buffer.from(v).toString('base64') }
-            : v
-        )
-      );
-    },
-    async deserialize(stream: ReadableStream<Uint8Array>): Promise<unknown> {
-      const chunks: Uint8Array[] = [];
-      const reader = stream.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) chunks.push(value);
-      }
-      return JSON.parse(Buffer.concat(chunks).toString(), (_key, v) =>
-        v !== null &&
-        typeof v === 'object' &&
-        v.__type === 'Uint8Array' &&
-        typeof v.data === 'string'
-          ? new Uint8Array(Buffer.from(v.data, 'base64'))
-          : v
-      );
-    },
-  };
   const generateMessageId = monotonicFactory();
 
   function getJobQueueName(): string {
     const jobPrefix = config.jobPrefix || 'workflow_';
     return `${jobPrefix}flows`;
   }
-
-  const createQueueHandler = localWorld.createQueueHandler;
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => {
     return 'postgres';
@@ -487,7 +450,7 @@ export function createQueue(
   const queue: Queue['queue'] = async (queue, message, opts) => {
     await start();
     const { id: queueId } = parseQueueName(queue);
-    const body = transport.serialize(message) as Buffer;
+    const body = serializeQueueMessage(message);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     await addGraphileJob({
       queueId,
@@ -502,11 +465,6 @@ export function createQueue(
     return { messageId };
   };
 
-  async function deserializeMessageBody(data: Buffer): Promise<unknown> {
-    const bodyStream = Stream.Readable.toWeb(Stream.Readable.from([data]));
-    return transport.deserialize(bodyStream as ReadableStream<Uint8Array>);
-  }
-
   function createTaskHandler(queue: QueuePrefix) {
     return async (payload: unknown, helpers: unknown) => {
       const messageData = MessageData.parse(payload);
@@ -515,7 +473,7 @@ export function createQueue(
         ? graphileHelpers.data.job.attempts
         : messageData.attempt;
       const queueName = `${queue}${messageData.id}` as ValidQueueName;
-      const body = await deserializeMessageBody(messageData.data);
+      const body = deserializeQueueMessage(messageData.data);
       QueuePayloadSchema.parse(body);
       const workflowInvoke = WorkflowInvokePayloadSchema.safeParse(body);
       const workflowRunSerializationKey =
@@ -642,7 +600,7 @@ export function createQueue(
   }
 
   return {
-    createQueueHandler,
+    createQueueHandler: createFetchQueueHandler,
     getDeploymentId,
     queue,
     start,
@@ -674,7 +632,6 @@ export function createQueue(
         workerUtils = null;
       }
       startPromise = null;
-      await localWorld.close?.();
     },
   };
 }

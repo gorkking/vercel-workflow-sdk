@@ -1,9 +1,12 @@
 import { createServer, type Server } from 'node:http';
-import { JsonTransport } from '@vercel/queue';
 import { setWorkflowBasePath } from '@workflow/utils';
 import { getWorkflowPort } from '@workflow/utils/get-port';
-import { MessageId, parseQueueName, type QueuePayload } from '@workflow/world';
-import { createWorld } from '@workflow/world-local';
+import {
+  MessageId,
+  parseQueueName,
+  type QueuePayload,
+  serializeQueueMessage,
+} from '@workflow/world';
 import {
   makeWorkerUtils,
   type Runner,
@@ -14,7 +17,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageData } from './message.js';
 import { createQueue } from './queue.js';
 
-const transport = new JsonTransport();
 const createdQueues: Array<ReturnType<typeof createQueue>> = [];
 const createdServers: Server[] = [];
 
@@ -30,15 +32,6 @@ vi.mock('@workflow/utils/get-port', () => ({
   getWorkflowPort: vi.fn(),
 }));
 
-vi.mock('@workflow/world-local', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@workflow/world-local')>();
-
-  return {
-    ...actual,
-    createWorld: vi.fn(actual.createWorld),
-  };
-});
-
 describe('postgres queue http execution', () => {
   const workerUtilsMock = {
     addJob: vi.fn(),
@@ -49,9 +42,6 @@ describe('postgres queue http execution', () => {
     stop: vi.fn(),
     promise: Promise.resolve(),
   };
-  const wrappedHandler = vi.fn(async () => Response.json({ ok: true }));
-  const localWorldClose = vi.fn();
-  const createQueueHandler = vi.fn(() => wrappedHandler);
   const pool = {
     query: vi.fn(async () => ({ rows: [{ exists: false }] })),
   } as any;
@@ -62,10 +52,6 @@ describe('postgres queue http execution', () => {
     vi.mocked(makeWorkerUtils).mockResolvedValue(workerUtilsMock);
     vi.mocked(getWorkflowPort).mockResolvedValue(undefined);
     vi.mocked(run).mockResolvedValue(runnerMock as unknown as Runner);
-    vi.mocked(createWorld).mockReturnValue({
-      createQueueHandler,
-      close: localWorldClose,
-    } as any);
   });
 
   afterEach(async () => {
@@ -554,7 +540,7 @@ function buildMessageData(
 
   return MessageData.encode({
     id,
-    data: transport.serialize(payload),
+    data: serializeQueueMessage(payload),
     attempt: opts?.attempt ?? 1,
     headers: opts?.headers,
     idempotencyKey: opts?.idempotencyKey,

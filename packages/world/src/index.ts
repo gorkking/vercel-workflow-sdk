@@ -80,6 +80,11 @@ export {
   ValidQueueName,
   WorkflowInvokePayloadSchema,
 } from './queue.js';
+export {
+  createFetchQueueHandler,
+  deserializeQueueMessage,
+  serializeQueueMessage,
+} from './queue-http.js';
 export { reenqueueActiveRuns } from './recovery.js';
 export type * from './runs.js';
 export {
