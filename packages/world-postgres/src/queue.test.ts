@@ -3,7 +3,6 @@ import {
   parseQueueName,
   type QueueHandler,
   type QueuePayload,
-  type QueuePrefix,
   serializeQueueMessage,
 } from '@workflow/world';
 import {
@@ -14,7 +13,7 @@ import {
 } from 'graphile-worker';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageData } from './message.js';
-import { createQueue } from './queue.js';
+import { createQueue, handlerRegistry } from './queue.js';
 
 const createdQueues: Array<ReturnType<typeof createQueue>> = [];
 
@@ -25,14 +24,6 @@ vi.mock('graphile-worker', () => ({
   makeWorkerUtils: vi.fn(),
   run: vi.fn(),
 }));
-
-// The handler registry is process-global (shared across module copies), so
-// tests must reset it between runs.
-const registry = (
-  globalThis as {
-    [key: symbol]: { handlers: Map<QueuePrefix, QueueHandler> };
-  }
-)[Symbol.for('@workflow/world-postgres//queueHandlers')];
 
 describe('postgres queue direct execution', () => {
   const workerUtilsMock = {
@@ -50,7 +41,9 @@ describe('postgres queue direct execution', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    registry.handlers.clear();
+    // The handler registry is process-global (shared across module copies),
+    // so tests must reset it between runs.
+    handlerRegistry.handlers.clear();
 
     vi.mocked(makeWorkerUtils).mockResolvedValue(workerUtilsMock);
     vi.mocked(run).mockResolvedValue(runnerMock as unknown as Runner);

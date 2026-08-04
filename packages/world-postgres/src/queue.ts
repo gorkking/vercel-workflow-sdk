@@ -57,20 +57,24 @@ const GraphileHelpers = z.object({
  * Queue handlers registered by the workflow runtime, keyed by queue prefix.
  * Held on globalThis so every copy of this module in the process (e.g. one
  * bundled into a route module and one loaded by instrumentation) shares a
- * single registry. The latest registration for a prefix wins, so a reloaded
- * route module (dev) replaces its predecessor.
+ * single registry. The latest registration for a prefix wins (a reloaded
+ * route module in dev replaces its predecessor), and handlers are never
+ * unregistered: they delegate to the runtime's global world resolution, so a
+ * world created later in the same process reuses them.
+ *
+ * Exported for tests.
  */
-type HandlerRegistry = {
+export type HandlerRegistry = {
   handlers: Map<QueuePrefix, QueueHandler>;
   onRegister: Set<() => void>;
 };
 const RegistryKey = Symbol.for('@workflow/world-postgres//queueHandlers');
 const globalScope = globalThis as { [RegistryKey]?: HandlerRegistry };
-const registry: HandlerRegistry = globalScope[RegistryKey] ?? {
+export const handlerRegistry: HandlerRegistry = globalScope[RegistryKey] ?? {
   handlers: new Map(),
   onRegister: new Set(),
 };
-globalScope[RegistryKey] = registry;
+globalScope[RegistryKey] = handlerRegistry;
 
 /**
  * Registers the runtime's queue handler for direct in-process execution by
@@ -78,8 +82,8 @@ globalScope[RegistryKey] = registry;
  * for the generated flow route.
  */
 const createQueueHandler: Queue['createQueueHandler'] = (prefix, handler) => {
-  registry.handlers.set(prefix, handler);
-  for (const notify of [...registry.onRegister]) notify();
+  handlerRegistry.handlers.set(prefix, handler);
+  for (const notify of [...handlerRegistry.onRegister]) notify();
   return createFetchQueueHandler(prefix, handler);
 };
 
@@ -110,10 +114,9 @@ export function createQueue(
     Promise<'completed' | 'rescheduled'>
   >();
   let workerUtilsPromise: Promise<WorkerUtils> | null = null;
-  let runnerPromise: Promise<void> | null = null;
-  let runner: Runner | null = null;
-  let closed = false;
+  let runnerPromise: Promise<Runner | null> | null = null;
   const closeController = new AbortController();
+  const closeSignal = closeController.signal;
 
   function ensureWorkerUtils(): Promise<WorkerUtils> {
     workerUtilsPromise ??= (async () => {
@@ -150,7 +153,6 @@ export function createQueue(
     idempotencyKey,
     headers,
     delaySeconds,
-    jobKey,
   }: {
     queueId: string;
     body: Buffer | Uint8Array;
@@ -159,7 +161,6 @@ export function createQueue(
     idempotencyKey?: string;
     headers?: Record<string, string>;
     delaySeconds?: number;
-    jobKey: string;
   }) {
     const utils = await ensureWorkerUtils();
     const runAt =
@@ -178,7 +179,9 @@ export function createQueue(
         headers,
       }),
       {
-        jobKey,
+        // One durable row per logical message: retries and timeoutSeconds
+        // reschedules replace the job instead of adding a second row.
+        jobKey: idempotencyKey ?? messageId,
         ...(runAt ? { runAt } : {}),
         maxAttempts: 3,
       }
@@ -234,7 +237,9 @@ export function createQueue(
 
   /** Resolves once a handler for this queue's prefix is registered, or on close. */
   function waitForHandler(): Promise<void> {
-    if (registry.handlers.has(workflowPrefix)) return Promise.resolve();
+    if (handlerRegistry.handlers.has(workflowPrefix) || closeSignal.aborted) {
+      return Promise.resolve();
+    }
 
     const warnTimer = setTimeout(() => {
       console.warn(
@@ -247,22 +252,23 @@ export function createQueue(
     return new Promise((resolve) => {
       const check = () => {
         if (
-          !registry.handlers.has(workflowPrefix) &&
-          !closeController.signal.aborted
+          !handlerRegistry.handlers.has(workflowPrefix) &&
+          !closeSignal.aborted
         ) {
           return;
         }
-        registry.onRegister.delete(check);
+        handlerRegistry.onRegister.delete(check);
+        closeSignal.removeEventListener('abort', check);
         clearTimeout(warnTimer);
         resolve();
       };
-      registry.onRegister.add(check);
-      closeController.signal.addEventListener('abort', check, { once: true });
+      handlerRegistry.onRegister.add(check);
+      closeSignal.addEventListener('abort', check);
     });
   }
 
   async function start(): Promise<void> {
-    if (closed) return;
+    if (closeSignal.aborted) return;
     await ensureWorkerUtils();
 
     // The runner starts only once a workflow handler is registered: jobs stay
@@ -270,10 +276,10 @@ export function createQueue(
     // by an enqueue-only process. Armed in the background so start() does not
     // block boot when the route module loads after instrumentation.
     if (!runnerPromise) {
-      runnerPromise = (async () => {
+      const armed = (async (): Promise<Runner | null> => {
         await waitForHandler();
-        if (closed) return;
-        runner = await run({
+        if (closeSignal.aborted) return null;
+        return run({
           pgPool: pool,
           // Default of 50 is high enough to avoid worker-pool exhaustion in
           // workflows that use parent→child polling patterns (e.g. awaiting a
@@ -290,18 +296,21 @@ export function createQueue(
           taskList: { [jobQueueName]: handleFlowJob },
         });
       })();
-      runnerPromise.catch((err) => {
-        runnerPromise = null;
+      armed.catch((err) => {
+        if (runnerPromise === armed) runnerPromise = null;
         console.error('[world-postgres] Queue runner failed to start:', err);
       });
+      runnerPromise = armed;
     }
-    if (registry.handlers.has(workflowPrefix)) {
+    if (handlerRegistry.handlers.has(workflowPrefix)) {
       await runnerPromise;
     }
   }
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
-    if (closed) throw new Error('[world-postgres] The queue is closed');
+    if (closeSignal.aborted) {
+      throw new Error('[world-postgres] The queue is closed');
+    }
     const { id: queueId } = parseQueueName(queueName);
     const messageId = MessageId.parse(`msg_${generateMessageId()}`);
     await addGraphileJob({
@@ -312,7 +321,6 @@ export function createQueue(
       idempotencyKey: opts?.idempotencyKey,
       headers: opts?.headers,
       delaySeconds: opts?.delaySeconds,
-      jobKey: opts?.idempotencyKey ?? messageId,
     });
     return { messageId };
   };
@@ -322,13 +330,11 @@ export function createQueue(
     helpers: unknown
   ): Promise<void> {
     const messageData = MessageData.parse(payload);
-    const graphileHelpers = GraphileHelpers.safeParse(helpers);
+    const { job } = GraphileHelpers.parse(helpers);
     // messageData.attempt is the first logical delivery this graphile job
     // represents; graphile's own `attempts` counts retries of this job. Their
     // sum survives timeoutSeconds reschedules, which create replacement jobs.
-    const attempt =
-      messageData.attempt +
-      (graphileHelpers.success ? graphileHelpers.data.job.attempts - 1 : 0);
+    const attempt = messageData.attempt + job.attempts - 1;
     const queueName = `${workflowPrefix}${messageData.id}` as ValidQueueName;
     const message = deserializeQueueMessage(messageData.data);
     QueuePayloadSchema.parse(message);
@@ -339,7 +345,7 @@ export function createQueue(
         : undefined;
 
     const executeTask = async (): Promise<'completed' | 'rescheduled'> => {
-      const handler = registry.handlers.get(workflowPrefix);
+      const handler = handlerRegistry.handlers.get(workflowPrefix);
       if (!handler) {
         // The runner only starts after registration; throwing hands the job
         // back to graphile for redelivery.
@@ -364,7 +370,6 @@ export function createQueue(
           idempotencyKey: messageData.idempotencyKey,
           headers: messageData.headers,
           delaySeconds: result.timeoutSeconds,
-          jobKey: messageData.idempotencyKey ?? messageData.messageId,
         });
         return 'rescheduled';
       }
@@ -426,9 +431,8 @@ export function createQueue(
     queue,
     start,
     async close() {
-      closed = true;
       closeController.abort();
-      await runnerPromise?.catch(() => {});
+      const runner = await runnerPromise?.catch(() => null);
       if (runner) {
         try {
           await runner.stop();
@@ -441,7 +445,7 @@ export function createQueue(
           }
         }
         await runner.promise.catch(() => {});
-        runner = null;
+        runnerPromise = null;
       }
       if (workerUtilsPromise) {
         const utils = await workerUtilsPromise.catch(() => null);
