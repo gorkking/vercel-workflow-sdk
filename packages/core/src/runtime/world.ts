@@ -216,12 +216,15 @@ export const getWorldHandlers = async (): Promise<WorldHandlers> => {
       throw err;
     });
   }
-  const _world = await globalSymbols[StubbedWorldCachePromise];
-  assertWorldSupportsRuntimeProtocol(_world);
-  globalSymbols[StubbedWorldCache] = _world;
+  const loadedWorld = await globalSymbols[StubbedWorldCachePromise];
+  // A world installed via setWorld() while the target world was loading
+  // takes precedence over the loaded one.
+  const world = globalSymbols[StubbedWorldCache] ?? loadedWorld;
+  assertWorldSupportsRuntimeProtocol(world);
+  globalSymbols[StubbedWorldCache] = world;
   return {
-    createQueueHandler: _world.createQueueHandler,
-    specVersion: _world.specVersion,
+    createQueueHandler: world.createQueueHandler,
+    specVersion: world.specVersion,
   };
 };
 
@@ -238,9 +241,13 @@ export const getWorld = async (): Promise<World> => {
       throw err;
     });
   }
-  globalSymbols[WorldCache] = await globalSymbols[WorldCachePromise];
-  assertWorldSupportsRuntimeProtocol(globalSymbols[WorldCache]);
-  return globalSymbols[WorldCache];
+  const loadedWorld = await globalSymbols[WorldCachePromise];
+  // A world installed via setWorld() while the target world was loading
+  // takes precedence over the loaded one.
+  const world = globalSymbols[WorldCache] ?? loadedWorld;
+  assertWorldSupportsRuntimeProtocol(world);
+  globalSymbols[WorldCache] = world;
+  return world;
 };
 
 /**

@@ -3642,7 +3642,25 @@ export function workflowEntrypoint(
       }
     );
 
-  let cachedHandler: ((req: Request) => Promise<Response>) | undefined;
+  // Build the handler eagerly at module load so the world sees
+  // createQueueHandler() before the first request. Worlds that execute queue
+  // messages in-process (e.g. @workflow/world-postgres) rely on this to have
+  // a handler registered when their queue runner starts. Cleared on failure
+  // so the next request retries instead of caching a transient init error.
+  let handlerPromise: Promise<(req: Request) => Promise<Response>> | undefined;
+  const getHandler = () => {
+    handlerPromise ??= (async () => {
+      try {
+        return handler(await getWorldHandlers());
+      } catch (err) {
+        handlerPromise = undefined;
+        throw err;
+      }
+    })();
+    return handlerPromise;
+  };
+  getHandler().catch(() => {});
+
   let invocationCount = 0;
   const entrypointCreatedAt = Date.now();
   const routeModuleBodyInitMs =
@@ -3652,7 +3670,10 @@ export function workflowEntrypoint(
 
   return withHealthCheck(async (req) => {
     invocationCount += 1;
-    const handlerCached = cachedHandler !== undefined;
+    // The first request traces (and reports) handler init even when the
+    // eager module-load init already completed, so the route telemetry keeps
+    // its meaning across the lazy→eager change.
+    const handlerCached = invocationCount > 1 && handlerPromise !== undefined;
     const spanKind = await getSpanKind('SERVER');
 
     return trace(
@@ -3675,17 +3696,13 @@ export function workflowEntrypoint(
         },
       },
       async (span) => {
-        if (!cachedHandler) {
-          cachedHandler = await trace('workflow.route.init', async () => {
-            const worldHandlers = await trace(
-              'workflow.route.get_world_handlers',
-              async () => getWorldHandlers()
+        const routeHandler = handlerCached
+          ? await getHandler()
+          : await trace('workflow.route.init', () =>
+              trace('workflow.route.get_world_handlers', getHandler)
             );
-            return handler(worldHandlers);
-          });
-        }
 
-        const response = await cachedHandler(req);
+        const response = await routeHandler(req);
         if (response instanceof Response) {
           span?.setAttributes(
             Attribute.HttpResponseStatusCode(response.status)
