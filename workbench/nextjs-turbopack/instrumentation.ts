@@ -1,6 +1,6 @@
 import { registerOTel } from '@vercel/otel';
 
-export function register() {
+export async function register() {
   registerOTel({
     serviceName: 'nextjs-turbopack',
     instrumentationConfig: {
@@ -17,4 +17,17 @@ export function register() {
       },
     },
   });
+
+  if (
+    process.env.NEXT_RUNTIME === 'nodejs' &&
+    process.env.WORKFLOW_TARGET_WORLD === '@workflow/world-postgres'
+  ) {
+    // Load the generated flow route module so it registers its queue handler
+    // (the Postgres world executes queue jobs in-process), then start the
+    // world's embedded queue worker.
+    await import('./app/.well-known/workflow/v1/flow/route');
+    const { getWorld } = await import('workflow/runtime');
+    const world = await getWorld();
+    await world.start?.();
+  }
 }

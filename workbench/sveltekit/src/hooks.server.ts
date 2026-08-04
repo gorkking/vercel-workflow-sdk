@@ -22,6 +22,9 @@ export const init: ServerInit = async () => {
   // Start the Postgres World
   // Needed since we test this in CI
   if (process.env.WORKFLOW_TARGET_WORLD === '@workflow/world-postgres') {
+    // Load the generated flow route module so it registers its queue handler
+    // (the Postgres world executes queue jobs in-process).
+    await import('./routes/.well-known/workflow/v1/flow/+server.js');
     const { getWorld } = await import('workflow/runtime');
     const world = await getWorld();
     if (world.start) {

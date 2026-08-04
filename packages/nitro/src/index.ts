@@ -476,6 +476,23 @@ function addVirtualHandler(
     'workflow/webhook.mjs': '',
     'workflow/workflows.mjs': `await import(/* @vite-ignore */ pathToFileURL(${stepsImportPath}).href + "?t=" + version);`,
   };
+  // Load the flow module at boot so its queue handler registers without an
+  // HTTP request — worlds like @workflow/world-postgres execute queue jobs
+  // in-process and only start consuming once a handler is registered.
+  // Retries because the dev builder may still be writing the bundle.
+  const bootLoad: Record<VirtualHandlerPath, string> = {
+    'workflow/webhook.mjs': '',
+    'workflow/workflows.mjs': /* js */ `
+      (async () => {
+        for (let attempt = 0; attempt < 60; attempt++) {
+          try {
+            await loadPOST();
+            return;
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      })();`,
+  };
 
   if (nitro.options.dev) {
     // Dev mode: load generated workflow bundles from disk at request time.
@@ -501,6 +518,7 @@ function addVirtualHandler(
         }
         return (await import(currentImportPath)).POST;
       }
+      ${bootLoad[buildPath]}
 
       export default fromWebHandler(async (request, context) => {
         const POST = await loadPOST();
@@ -525,6 +543,7 @@ function addVirtualHandler(
         }
         return (await import(currentImportPath)).POST;
       }
+      ${bootLoad[buildPath]}
 
       export default async ({ req }) => {
         try {

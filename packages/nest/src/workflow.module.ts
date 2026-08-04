@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 import {
   type DynamicModule,
   Module,
@@ -74,19 +75,24 @@ export class WorkflowModule implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit() {
     const options = WorkflowModule.options;
-    if (!options || options.skipBuild) {
+    const outDir = WorkflowModule.outDir;
+    if (!options || !outDir) {
       return;
     }
-    // Lazy-load the toolchain so it never enters the runtime bundle.
-    const [{ NestLocalBuilder }, { createBuildQueue }] = await Promise.all([
-      import('./builder.js'),
-      import('@workflow/builders'),
-    ]);
-    const builder = new NestLocalBuilder({
-      ...options,
-      outDir: WorkflowModule.outDir ?? undefined,
-    });
-    await createBuildQueue()(() => builder.build());
+    if (!options.skipBuild) {
+      // Lazy-load the toolchain so it never enters the runtime bundle.
+      const [{ NestLocalBuilder }, { createBuildQueue }] = await Promise.all([
+        import('./builder.js'),
+        import('@workflow/builders'),
+      ]);
+      const builder = new NestLocalBuilder({ ...options, outDir });
+      await createBuildQueue()(() => builder.build());
+    }
+    // Load the generated bundles so the workflow queue handler registers at
+    // boot — worlds like @workflow/world-postgres execute queue jobs
+    // in-process and only start consuming once a handler is registered.
+    await import(pathToFileURL(join(outDir, 'steps.mjs')).href);
+    await import(pathToFileURL(join(outDir, 'workflows.mjs')).href);
   }
 
   async onModuleDestroy() {
