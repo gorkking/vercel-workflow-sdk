@@ -3659,7 +3659,12 @@ export function workflowEntrypoint(
     })();
     return handlerPromise;
   };
-  getHandler().catch(() => {});
+  getHandler().catch((err) => {
+    console.error(
+      '[workflow] Failed to initialize the flow queue handler at module load; retrying on the first request:',
+      err
+    );
+  });
 
   let invocationCount = 0;
   const entrypointCreatedAt = Date.now();
