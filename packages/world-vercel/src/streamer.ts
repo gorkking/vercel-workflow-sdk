@@ -27,6 +27,7 @@ import {
   type HttpConfig,
   makeRequest,
 } from './utils.js';
+import { isWsStreamsTransportEnabled } from './ws-transport-enabled.js';
 
 /**
  * Maximum number of chunks per request, matching the server-side
@@ -39,7 +40,7 @@ export const MAX_CHUNKS_PER_REQUEST = 1000;
  * `WORKFLOW_MAX_CHUNKS_PER_REQUEST` — lower it (paired with the server's
  * `MAX_CHUNKS_PER_BATCH` override) to exercise the batch-splitting path.
  */
-const getMaxChunksPerRequest = (): number =>
+export const getMaxChunksPerRequest = (): number =>
   envNumber('WORKFLOW_MAX_CHUNKS_PER_REQUEST', MAX_CHUNKS_PER_REQUEST, {
     integer: true,
     min: 1,
@@ -212,6 +213,11 @@ export function createStreamer(config?: APIConfig): Streamer {
         // Await runId if it's a promise to ensure proper flushing
         const resolvedRunId = await runId;
 
+        if (isWsStreamsTransportEnabled()) {
+          const { writeStreamOverWs } = await import('./ws-streamer.js');
+          return writeStreamOverWs(resolvedRunId, name, chunk, config);
+        }
+
         const httpConfig = await getHttpConfig(config);
         const url = getStreamUrl(name, resolvedRunId, httpConfig);
         const response = await instrumentedFetch({
@@ -245,6 +251,11 @@ export function createStreamer(config?: APIConfig): Streamer {
 
         // Await runId if it's a promise to ensure proper flushing
         const resolvedRunId = await runId;
+
+        if (isWsStreamsTransportEnabled()) {
+          const { writeMultiStreamOverWs } = await import('./ws-streamer.js');
+          return writeMultiStreamOverWs(resolvedRunId, name, chunks, config);
+        }
 
         const httpConfig = await getHttpConfig(config);
 
@@ -291,6 +302,11 @@ export function createStreamer(config?: APIConfig): Streamer {
         // Await runId if it's a promise to ensure proper flushing
         const resolvedRunId = await runId;
 
+        if (isWsStreamsTransportEnabled()) {
+          const { closeStreamOverWs } = await import('./ws-streamer.js');
+          return closeStreamOverWs(resolvedRunId, name, config);
+        }
+
         const httpConfig = await getHttpConfig(config);
         httpConfig.headers.set('X-Stream-Done', 'true');
         const url = getStreamUrl(name, resolvedRunId, httpConfig);
@@ -320,6 +336,10 @@ export function createStreamer(config?: APIConfig): Streamer {
       },
 
       async get(runId: string, name: string, startIndex?: number) {
+        if (isWsStreamsTransportEnabled()) {
+          const { readStreamOverWs } = await import('./ws-streamer.js');
+          return readStreamOverWs(runId, name, startIndex, config);
+        }
         const httpConfig = await getHttpConfig(config);
         // Stream bytes themselves are untyped binary, but any pre-header error
         // is a JSON envelope. Asking explicitly avoids a CBOR 410 that this
