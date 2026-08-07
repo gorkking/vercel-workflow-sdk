@@ -107,31 +107,46 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
 
   const STREAM_TOPIC = 'workflow_event_chunk';
 
-  const listenSubscription = listenChannel(pool, STREAM_TOPIC, async (msg) => {
-    const parsed = StreamPublishMessage.parse(JSON.parse(msg));
-
-    const key = `strm:${parsed.streamId}` as const;
-    if (!events.listenerCount(key)) {
-      return;
-    }
-
-    const resource = getMutex(key);
-    await resource.mutex.andThen(async () => {
-      const [value] = await drizzle
-        .select({ eof: streams.eof, data: streams.chunkData })
-        .from(streams)
-        .where(
-          and(
-            eq(streams.streamId, parsed.streamId),
-            eq(streams.chunkId, parsed.chunkId)
-          )
-        )
-        .limit(1);
-      if (!value) return;
-      const { data, eof } = value;
-      events.emit(key, { id: parsed.chunkId, data, eof });
+  // The LISTEN client only serves stream reads (writes publish via pg_notify
+  // on the pool), so connect on the first read: constructing a world must not
+  // open connections — the runtime builds worlds eagerly at module load, and
+  // route modules are also evaluated during framework builds. Reset on
+  // failure so the next read retries instead of caching the rejection.
+  let listenSubscription: ReturnType<typeof listenChannel> | null = null;
+  const ensureListening = () => {
+    listenSubscription ??= startListening().catch((err) => {
+      listenSubscription = null;
+      throw err;
     });
-  });
+    return listenSubscription;
+  };
+
+  const startListening = () =>
+    listenChannel(pool, STREAM_TOPIC, async (msg) => {
+      const parsed = StreamPublishMessage.parse(JSON.parse(msg));
+
+      const key = `strm:${parsed.streamId}` as const;
+      if (!events.listenerCount(key)) {
+        return;
+      }
+
+      const resource = getMutex(key);
+      await resource.mutex.andThen(async () => {
+        const [value] = await drizzle
+          .select({ eof: streams.eof, data: streams.chunkData })
+          .from(streams)
+          .where(
+            and(
+              eq(streams.streamId, parsed.streamId),
+              eq(streams.chunkId, parsed.chunkId)
+            )
+          )
+          .limit(1);
+        if (!value) return;
+        const { data, eof } = value;
+        events.emit(key, { id: parsed.chunkId, data, eof });
+      });
+    });
 
   const notifyStream = async (payload: string) => {
     await pool.query('SELECT pg_notify($1, $2)', [STREAM_TOPIC, payload]);
@@ -393,6 +408,9 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
               }
               enqueue(data);
             }
+            // LISTEN must be active before the catch-up query below, so no
+            // chunk written between the query and the subscription is missed.
+            await ensureListening();
             events.on(`strm:${name}`, onData);
             cleanups.push(() => {
               events.off(`strm:${name}`, onData);
@@ -441,7 +459,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
     },
 
     async close() {
-      const sub = await listenSubscription.catch(() => undefined);
+      const sub = await listenSubscription?.catch(() => undefined);
       if (sub) await sub.close();
     },
   };
