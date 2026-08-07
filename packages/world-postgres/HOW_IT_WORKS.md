@@ -31,7 +31,7 @@ Real-time data streaming via **PostgreSQL LISTEN/NOTIFY**:
 - `pg_notify` triggers sent on writes to `workflow_event_chunk` topic
 - Subscribers receive notifications and fetch chunk data
 - ULID-based ordering ensures correct sequence
-- One long-lived dedicated `LISTEN` client, with an in-process EventEmitter for distributing events to multiple subscribers
+- One long-lived dedicated `LISTEN` client (connected lazily on the first stream read — constructing a world opens no connections), with an in-process EventEmitter for distributing events to multiple subscribers
 
 ## Setup
 
