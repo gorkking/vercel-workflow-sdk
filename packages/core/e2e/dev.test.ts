@@ -1097,6 +1097,9 @@ ${apiFileContent}`
         };
 
         let snapshot = await waitForGeneratedArtifactStability();
+        const expectedBodyOnlyRebuild = finalConfig.canary
+          ? ('any' as const)
+          : { hot: 1 };
         const cases = [
           {
             file: files.step,
@@ -1153,7 +1156,7 @@ export async function hmrFuzzWorkflow() {
           {
             file: files.workflowHelper,
             kind: 'workflow',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             expectedWorkflowValue: (iteration: number) =>
               `workflow-helper-body-${iteration}`,
             source: (
@@ -1168,7 +1171,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.sharedHelper,
             kind: 'workflow',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             expectedStepValue: (iteration: number) =>
               `shared-body-${iteration}`,
             expectedWorkflowValue: (iteration: number) =>
@@ -1183,7 +1186,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.serde,
             kind: 'serde',
-            expectedLogCounts: { hot: 1 },
+            expectedLogCounts: expectedBodyOnlyRebuild,
             source: (iteration: number) => `export class HmrFuzzBox {
   static classId = 'HmrFuzzBox';
 
@@ -1280,6 +1283,26 @@ export async function hmrFuzzWorkflow() {
                 description:
                   'workflow import graph full rediscovery to affect execution',
                 workflowValue: 'imported-stable',
+              });
+            },
+          },
+          {
+            description: 'new workflow dependency body change',
+            expectedLogCounts: { full: 1 },
+            write: async () => {
+              await fs.writeFile(
+                files.importHelper,
+                "export const hmrFuzzImportedValue = 'imported-updated';\n"
+              );
+            },
+            assert: async () => {
+              if (finalConfig.canary) {
+                return;
+              }
+              await expectWorkflowResult({
+                description:
+                  'new workflow dependency body change to affect execution',
+                workflowValue: 'imported-updated',
               });
             },
           },
