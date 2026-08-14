@@ -6,7 +6,7 @@
  * o11y, CLI o11y). It has NO Node.js dependencies.
  */
 
-import { getEventDataRefFields } from '@workflow/world';
+import { getEventDataRefFields } from '@workflow/world/event-metadata';
 import { parse, unflatten } from 'devalue';
 
 // ---------------------------------------------------------------------------
