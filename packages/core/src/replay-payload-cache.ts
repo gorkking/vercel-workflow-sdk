@@ -10,7 +10,7 @@ import { recordCompression } from './serialization/telemetry.js';
 type ReplayPayloadPreparer = (
   data: Uint8Array,
   key: DecryptionKey | undefined
-) => PreparedReplayPayload | Promise<PreparedReplayPayload>;
+) => Uint8Array | Promise<Uint8Array>;
 
 /** Copy a view only when retaining it would also retain unrelated bytes. */
 function compactOwnedBytes(data: Uint8Array): Uint8Array {
@@ -22,25 +22,14 @@ function compactOwnedBytes(data: Uint8Array): Uint8Array {
 async function prepareReplayPayload(
   data: Uint8Array,
   key: DecryptionKey | undefined
-): Promise<PreparedReplayPayload> {
+): Promise<Uint8Array> {
   const compressionStats: CompressionStats = {};
   const prepared = await decodePayload(data, key, compressionStats);
   await recordCompression(compressionStats, 'deserialize');
-  return { data: compactOwnedBytes(prepared) };
+  return prepared;
 }
 
 const WORKFLOW_INPUT_CACHE_KEY = 'workflow-input';
-
-type KeyState =
-  | { state: 'loading'; promise: Promise<DecryptionKey | undefined> }
-  | { state: 'ready'; value: DecryptionKey | undefined }
-  | { state: 'failed'; error: unknown };
-
-type Preparation =
-  | { state: 'waitingForKey'; value: Uint8Array }
-  | { state: 'ready'; value: PreparedReplayPayload }
-  | { state: 'preparing'; promise: Promise<PreparedReplayPayload> }
-  | { state: 'failed'; error: unknown };
 
 function isCacheablePrimitive(value: unknown): boolean {
   const type = typeof value;
@@ -59,27 +48,31 @@ function isCacheablePrimitive(value: unknown): boolean {
  * share and skip that repeated deserialization entirely.
  */
 export class ReplayPayloadCache {
-  private key: KeyState;
-  private readonly preparations = new Map<string, Preparation>();
+  private readonly preparations = new Map<
+    string,
+    Uint8Array | Promise<Uint8Array> | { readonly error: unknown }
+  >();
   private readonly primitiveValues = new Map<string, unknown>();
   private nextUnscannedEventIndex = 0;
+  private encryptionKeyPromise?: Promise<DecryptionKey | undefined>;
 
   constructor(
-    key?: DecryptionKey,
+    private encryptionKey?: DecryptionKey,
     private readonly preparer: ReplayPayloadPreparer = prepareReplayPayload
-  ) {
-    this.key = { state: 'ready', value: key };
-  }
+  ) {}
 
   static waitingForKey(
     key: Promise<DecryptionKey | undefined>,
     preparer: ReplayPayloadPreparer = prepareReplayPayload
   ): ReplayPayloadCache {
     const cache = new ReplayPayloadCache(undefined, preparer);
-    cache.key = { state: 'loading', promise: key };
+    cache.encryptionKeyPromise = key;
     void key.then(
-      (value) => cache.resolveKey(value),
-      (error) => cache.rejectKey(error)
+      (value) => {
+        cache.encryptionKey = value;
+        cache.encryptionKeyPromise = undefined;
+      },
+      () => {}
     );
     return cache;
   }
@@ -195,54 +188,33 @@ export class ReplayPayloadCache {
     }
 
     onPreparationStart?.();
-    switch (this.key.state) {
-      case 'loading':
-        this.preparations.set(cacheKey, { state: 'waitingForKey', value });
-        break;
-      case 'ready':
-        this.runPreparation(cacheKey, value, this.key.value);
-        break;
-      case 'failed':
-        this.preparations.set(cacheKey, {
-          state: 'failed',
-          error: this.key.error,
-        });
-        break;
-    }
+    this.runPreparation(cacheKey, value);
   }
 
-  private runPreparation(
-    cacheKey: string,
-    value: Uint8Array,
-    key: DecryptionKey | undefined
-  ): void {
+  private runPreparation(cacheKey: string, value: Uint8Array): void {
     try {
-      const result = this.preparer(value, key);
+      const result = this.encryptionKeyPromise
+        ? this.encryptionKeyPromise.then((key) => this.preparer(value, key))
+        : this.preparer(value, this.encryptionKey);
       if (!(result instanceof Promise)) {
-        this.preparations.set(cacheKey, { state: 'ready', value: result });
+        this.preparations.set(cacheKey, compactOwnedBytes(result));
         return;
       }
 
-      this.preparations.set(cacheKey, { state: 'preparing', promise: result });
-      void result.then(
+      const compacted = result.then(compactOwnedBytes);
+      this.preparations.set(cacheKey, compacted);
+      void compacted.then(
         (prepared) => {
           const current = this.preparations.get(cacheKey);
-          if (current?.state === 'preparing' && current.promise === result) {
-            this.preparations.set(cacheKey, {
-              state: 'ready',
-              value: prepared,
-            });
-          }
+          if (current === compacted) this.preparations.set(cacheKey, prepared);
         },
         (error) => {
           const current = this.preparations.get(cacheKey);
-          if (current?.state === 'preparing' && current.promise === result) {
-            this.preparations.set(cacheKey, { state: 'failed', error });
-          }
+          if (current === compacted) this.preparations.set(cacheKey, { error });
         }
       );
     } catch (error) {
-      this.preparations.set(cacheKey, { state: 'failed', error });
+      this.preparations.set(cacheKey, { error });
     }
   }
 
@@ -253,59 +225,25 @@ export class ReplayPayloadCache {
     if (!(value instanceof Uint8Array)) return { data: value };
 
     this.startPreparation(cacheKey, value);
-    const preparation = this.preparations.get(cacheKey);
-    if (!preparation) {
+    const prepared = this.preparations.get(cacheKey);
+    if (!prepared) {
       throw new Error(
         `Replay payload preparation was not started: ${cacheKey}`
       );
     }
 
-    switch (preparation.state) {
-      case 'ready':
-        return preparation.value;
-      case 'preparing':
-        return preparation.promise.catch((error) => {
-          const current = this.preparations.get(cacheKey);
-          if (
-            current?.state === 'failed' ||
-            (current?.state === 'preparing' &&
-              current.promise === preparation.promise)
-          ) {
-            this.preparations.delete(cacheKey);
-          }
+    if (prepared instanceof Uint8Array) return { data: prepared };
+    if (prepared instanceof Promise) {
+      return prepared.then(
+        (data) => ({ data }),
+        (error) => {
+          this.preparations.delete(cacheKey);
           throw error;
-        });
-      case 'failed':
-        this.preparations.delete(cacheKey);
-        throw preparation.error;
-      case 'waitingForKey':
-        if (this.key.state !== 'loading') {
-          throw new Error(`Replay payload key was not resolved: ${cacheKey}`);
         }
-        return this.key.promise.then(() =>
-          this.getPreparedPayload(cacheKey, value)
-        );
+      );
     }
-  }
-
-  private resolveKey(value: DecryptionKey | undefined): void {
-    if (this.key.state !== 'loading') return;
-    this.key = { state: 'ready', value };
-    for (const [cacheKey, preparation] of this.preparations) {
-      if (preparation.state === 'waitingForKey') {
-        this.runPreparation(cacheKey, preparation.value, value);
-      }
-    }
-  }
-
-  private rejectKey(error: unknown): void {
-    if (this.key.state !== 'loading') return;
-    this.key = { state: 'failed', error };
-    for (const [cacheKey, preparation] of this.preparations) {
-      if (preparation.state === 'waitingForKey') {
-        this.preparations.set(cacheKey, { state: 'failed', error });
-      }
-    }
+    this.preparations.delete(cacheKey);
+    throw prepared.error;
   }
 
   private eventPayloadKey(eventId: string): string {
