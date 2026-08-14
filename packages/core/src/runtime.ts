@@ -1698,7 +1698,7 @@ export function workflowEntrypoint(
                         getStepFunction(incomingStepName)?.maxRetries ??
                         DEFAULT_STEP_MAX_RETRIES;
                       if (metadata.attempt > bgMaxRetries + 1) {
-                        const loaded = await loadWorkflowRunEvents(runId);
+                        const loaded = await loadWorkflowRunEvents({ runId });
                         bgAuthoritativeAttempt =
                           countStepStartedEvents(
                             loaded.events,
@@ -1813,7 +1813,7 @@ export function workflowEntrypoint(
                         // Load events to check if all parallel steps are done.
                         // Use cursor-based loading so the main loop can continue
                         // incrementally from here.
-                        const loaded = await loadWorkflowRunEvents(runId);
+                        const loaded = await loadWorkflowRunEvents({ runId });
                         eventLog = nextEventLogLoad(loaded);
 
                         // Check for pending steps: any step_created without
@@ -2714,11 +2714,11 @@ export function workflowEntrypoint(
                         if (eventLog.type === 'loadAfter') {
                           appendEventLog(
                             eventLog,
-                            await loadWorkflowRunEvents(
+                            await loadWorkflowRunEvents({
                               runId,
-                              eventLog.cursor,
-                              observeReplayEvent
-                            )
+                              afterCursor: eventLog.cursor,
+                              onEvent: observeReplayEvent,
+                            })
                           );
                           eventLog = { ...eventLog, type: 'ready' };
                         }
@@ -2771,13 +2771,14 @@ export function workflowEntrypoint(
                       }
 
                       if (eventLog.type !== 'ready') {
-                        const page = await loadWorkflowRunEvents(
+                        const page = await loadWorkflowRunEvents({
                           runId,
-                          eventLog.type === 'loadAfter'
-                            ? eventLog.cursor
-                            : undefined,
-                          observeReplayEvent
-                        );
+                          afterCursor:
+                            eventLog.type === 'loadAfter'
+                              ? eventLog.cursor
+                              : undefined,
+                          onEvent: observeReplayEvent,
+                        });
                         if (eventLog.type === 'loadAfter') {
                           appendEventLog(eventLog, page);
                           eventLog = { ...eventLog, type: 'ready' };
@@ -2894,11 +2895,11 @@ export function workflowEntrypoint(
                         // not include the wait completion this handler just
                         // attempted.
                         if (eventLog.cursor) {
-                          const page = await loadWorkflowRunEvents(
+                          const page = await loadWorkflowRunEvents({
                             runId,
-                            eventLog.cursor,
-                            observeReplayEvent
-                          );
+                            afterCursor: eventLog.cursor,
+                            onEvent: observeReplayEvent,
+                          });
                           const completedWaitIdsAfterCursor = new Set(
                             page.events
                               .filter((e) => e.eventType === 'wait_completed')
@@ -2915,21 +2916,19 @@ export function workflowEntrypoint(
                             appendEventLog(eventLog, page);
                           } else {
                             eventLog = {
-                              ...(await loadWorkflowRunEvents(
+                              ...(await loadWorkflowRunEvents({
                                 runId,
-                                undefined,
-                                observeReplayEvent
-                              )),
+                                onEvent: observeReplayEvent,
+                              })),
                               type: 'ready',
                             };
                           }
                         } else {
                           eventLog = {
-                            ...(await loadWorkflowRunEvents(
+                            ...(await loadWorkflowRunEvents({
                               runId,
-                              undefined,
-                              observeReplayEvent
-                            )),
+                              onEvent: observeReplayEvent,
+                            })),
                             type: 'ready',
                           };
                         }
