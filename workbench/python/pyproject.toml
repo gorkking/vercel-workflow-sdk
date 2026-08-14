@@ -24,6 +24,15 @@ dependencies = [
   # `@workflow/world-vercel` encrypts it whenever it can resolve a per-run key,
   # which on a deployment it always can, with no opt-out.
   "vercel",
+  # And `vercel-workflow` as well, which the note above says to add "if they
+  # differ" — they do, as of this rev. A `[tool.uv.sources]` entry only applies
+  # to a direct requirement, so without this line the git pin below reaches
+  # `vercel` and every sibling still comes from PyPI. That was harmless while
+  # `4814d61f` and the 0.9.0 release were byte-identical; the rev pinned now is
+  # one commit past it and that commit is *entirely* inside
+  # `src/vercel-workflow`, so pinning `vercel` alone would have installed the
+  # release and silently tested the code without the fix.
+  "vercel-workflow",
   # vercel-py carries uvicorn as a dev-only dependency, so declare it here.
   "uvicorn>=0.30",
 ]
@@ -65,7 +74,8 @@ dependencies = [
 #     builder then reject under `--locked`. `uv run` re-locks too, which is why
 #     the `dev` script passes it as well.
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", rev = "4814d61fa2ac1074ea5d67aede8f159ba1daae9b", subdirectory = "src/vercel" }
+vercel = { git = "https://github.com/vercel/vercel-py", rev = "6a10dd4c03457efce22c28986bafecbb925624a7", subdirectory = "src/vercel" }
+vercel-workflow = { git = "https://github.com/vercel/vercel-py", rev = "6a10dd4c03457efce22c28986bafecbb925624a7", subdirectory = "src/vercel-workflow" }
 
 # How `@vercel/python` builds this app. Reached only because `vercel.json`
 # declares `pyproject.toml` as the build src, which puts the builder in

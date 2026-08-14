@@ -269,30 +269,71 @@ files in one process while the queue delivery takes an HTTP round trip, so
 ## Conformance baseline
 
 What the suite runs here is declared in `e2e-conformance.json`: the ported
-fixtures, and — when there is one — an `unsupported` map naming individual tests
-whose failure is a runtime gap rather than a missing fixture. There is none right
-now. Both axes are ratchets: a claim that stops being true fails the run instead
-of quietly skipping, so growing the file is the only way to move.
-`ConformanceConfig` in `packages/core/e2e/utils.ts` spells out each direction.
+fixtures, and an `unsupported` map naming individual tests whose failure is a
+runtime gap rather than a missing fixture. Both axes are ratchets: a claim that
+stops being true fails the run instead of quietly skipping, so growing the file is
+the only way to move. `ConformanceConfig` in `packages/core/e2e/utils.ts` spells
+out each direction.
 
-Current baseline: **9 passing, 128 skipped, of 137** on `world-local`, and
-**8 of 156** on Vercel. It is one baseline, not two — the extra 19 collected on
-Vercel are `e2e-agent.test.ts`, which that lane also picks up and skips whole,
-and the ninth pass is `deploymentId: 'latest' is a no-op in non-Vercel worlds`,
-which is local by definition.
+Current baseline: **29 passing, 108 skipped, of 137** on `world-local` — 24
+fixtures and 3 exempted tests. The Vercel lane collects 19 more tests
+(`e2e-agent.test.ts`, which it also picks up and skips whole) and passes one
+fewer, because `deploymentId: 'latest' is a no-op in non-Vercel worlds` is local
+by definition. It is one baseline, not two.
+
+The three exemptions are two upstream causes, and both are ones this lane found
+rather than predicted:
+
+- **`hookTokenReuseLoopWorkflow`** — `hook_created` and `hook_disposed` are
+  flushed with no ordering between them, so a run conflicts against its own
+  disposed hook. The event log says it outright: `hook_created` (round 0),
+  `hook_received` (round 0), `hook_conflict` (round 1), `hook_disposed`
+  (round 0). That is the shape upstream fixed as #2777 on the TypeScript side.
+- **The two `FatalError` tests** — the step *lifecycle* is right, one attempt and
+  the run fails on it, but a thrown error does not keep its identity across the
+  event log. `step_failed.error` is written as text and comes back as
+  `RuntimeError`, so the workflow's `except` sees no `FatalError` and the failed
+  run's `errorCode` is `RuntimeError` where the driver wants `USER_ERROR`.
+
+Two things that used to be here are worth noting as gone, because both were
+costing more than their own tests. A hook payload followed by a step used to
+never create the step, which took out two fixtures and — since those were the
+only fixtures producing an `encp` payload — also stopped this lane from checking
+`encp` at all; both are fixed upstream and in the baseline now. And `encp`
+itself, which is not the niche format its name suggests: on Vercel *every* hook
+payload arrives sealed to the run's public key, because the driver resumes from
+outside the run with no symmetric key, so a runtime that cannot read it fails
+every hook fixture outright.
 
 ## What is missing
 
 This app is honest about being early. In rough order of how much it costs:
 
-- **Most fixtures are simply not ported yet** — 66 tests across 52 fixtures.
-  They are not blocked on one thing anymore: the largest blocks are hooks (19
-  tests, where vercel-py's `BaseHook.wait()` has a different shape than the
-  async-iterable hook the fixtures use), streams (11, where vercel-py now has
-  `read_stream` / `get_writable` and nothing here uses them yet),
-  `setAttributes` (9, no Python equivalent), and `FatalError` /
-  `RetryableError` (7 — `FatalError` is exported now, `RetryableError` has no
-  Python counterpart at all).
+- **Most fixtures are still not ported** — roughly 39 tests across 31 fixtures.
+  What changed is not the size but the shape: every one of them now names a
+  missing API, where the list used to include "ordinary porting". Streams are
+  gone from it entirely (`get_writable` landed and three fixtures use it), and so
+  is the largest old entry — hooks were said to need a design decision because
+  `BaseHook.wait()` "has a different shape than the async-iterable hook the
+  fixtures use", which is simply not so: `HookEvent` implements `__await__` *and*
+  `__aiter__` / `__anext__`, so `for await (const p of hook)` ports to
+  `async for payload in hook` unchanged, and four hook fixtures are in on that
+  basis.
+
+  What is left, by size: hooks again (11 fixtures / 15 tests) but for two named
+  things — `metadata` on `BaseHook.wait()`, where the wire model
+  `HookCreatedEventData` already carries the field and only the authoring API
+  cannot fill it, and a `getConflict()` equivalent, which also needs
+  `hook_conflict`'s `conflictingRunId` to stop being parsed away. Then
+  `setAttributes` (9 tests, no Python equivalent at all, and spec version 4,
+  which Python does not claim), distributed abort (3), and single names:
+  `RetryableError`, `getWorkflowMetadata`, a `ReadableStream` returned from a
+  step, and invoking a step id that was never registered.
+
+  Three fixtures are unportable by design rather than by gap: `fetchWorkflow` and
+  the two that call `start()` from a workflow body do what the Python sandbox
+  denies on purpose. `spawnWorkflowFromStepWorkflow` is the supported shape and is
+  ported.
 - **The `.well-known/workflow/v1` surface lives in `app.py`, not the SDK**, and
   reaching it needs three `vercel.workflow._internal` imports
   (`workflow_entrypoint`, `FLOW_ROUTE`, and the `HTTPRequest` base), none of

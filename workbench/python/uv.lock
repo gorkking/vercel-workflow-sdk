@@ -568,7 +568,7 @@ wheels = [
 [[package]]
 name = "vercel"
 version = "0.10.0"
-source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=4814d61fa2ac1074ea5d67aede8f159ba1daae9b#4814d61fa2ac1074ea5d67aede8f159ba1daae9b" }
+source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=6a10dd4c03457efce22c28986bafecbb925624a7#6a10dd4c03457efce22c28986bafecbb925624a7" }
 dependencies = [
     { name = "anyio" },
     { name = "httpx" },
@@ -687,7 +687,7 @@ wheels = [
 [[package]]
 name = "vercel-workflow"
 version = "0.9.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel-workflow&rev=6a10dd4c03457efce22c28986bafecbb925624a7#6a10dd4c03457efce22c28986bafecbb925624a7" }
 dependencies = [
     { name = "anyio" },
     { name = "cbor2" },
@@ -698,10 +698,6 @@ dependencies = [
     { name = "vercel-internal-core" },
     { name = "vercel-oidc" },
     { name = "vercel-queue" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/df/91/e852e0803d45c06c0f493d1b96fe8b1e6a7246f971889d47182e7722b547/vercel_workflow-0.9.0.tar.gz", hash = "sha256:88f3483e2ea3595e02db48741af6de8e545dd574146453295d66a5a6a06d44da", size = 103391, upload-time = "2026-08-14T17:03:16.59Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/9f/84892f5e2bc4d4d44a2823d1fd5dc1f72fe91e9921c419631d4fd56df71c/vercel_workflow-0.9.0-py3-none-any.whl", hash = "sha256:9da5ee97f0460e87ec185b107166c66e57d93e11d82e6953a22ed994888e93af", size = 112718, upload-time = "2026-08-14T17:03:15.258Z" },
 ]
 
 [[package]]
@@ -827,10 +823,12 @@ source = { virtual = "." }
 dependencies = [
     { name = "uvicorn" },
     { name = "vercel" },
+    { name = "vercel-workflow" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
-    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=4814d61fa2ac1074ea5d67aede8f159ba1daae9b" },
+    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=6a10dd4c03457efce22c28986bafecbb925624a7" },
+    { name = "vercel-workflow", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel-workflow&rev=6a10dd4c03457efce22c28986bafecbb925624a7" },
 ]
