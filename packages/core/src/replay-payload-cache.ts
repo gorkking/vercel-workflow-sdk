@@ -42,8 +42,12 @@ type Preparation =
   | { state: 'pending'; promise: Promise<PreparedReplayPayload> }
   | { state: 'failed'; error: unknown };
 
-function isPrimitive(value: unknown): boolean {
-  return value === null || !['object', 'function'].includes(typeof value);
+function isCacheablePrimitive(value: unknown): boolean {
+  const type = typeof value;
+  return (
+    value === null ||
+    (type !== 'object' && type !== 'function' && type !== 'symbol')
+  );
 }
 
 /**
@@ -55,46 +59,29 @@ function isPrimitive(value: unknown): boolean {
  * share and skip that repeated deserialization entirely.
  */
 export class ReplayPayloadCache {
+  private key: KeyState;
   private readonly preparations = new Map<string, Preparation>();
-  private readonly pendingPreparations = new Set<
-    Promise<PreparedReplayPayload>
-  >();
   private readonly primitiveValues = new Map<string, unknown>();
   private nextUnscannedEventIndex = 0;
 
-  private constructor(
-    private key: KeyState,
+  constructor(
+    key?: DecryptionKey,
     private readonly preparer: ReplayPayloadPreparer = prepareReplayPayload
   ) {
-    if (key.state === 'pending') {
-      void key.promise.then(
-        (value) => this.resolveKey(value),
-        (error) => this.rejectKey(error)
-      );
-    }
-  }
-
-  static unencrypted(
-    preparer: ReplayPayloadPreparer = prepareReplayPayload
-  ): ReplayPayloadCache {
-    return new ReplayPayloadCache(
-      { state: 'ready', value: undefined },
-      preparer
-    );
-  }
-
-  static withKey(
-    key: DecryptionKey,
-    preparer: ReplayPayloadPreparer = prepareReplayPayload
-  ): ReplayPayloadCache {
-    return new ReplayPayloadCache({ state: 'ready', value: key }, preparer);
+    this.key = { state: 'ready', value: key };
   }
 
   static waitingForKey(
     key: Promise<DecryptionKey | undefined>,
     preparer: ReplayPayloadPreparer = prepareReplayPayload
   ): ReplayPayloadCache {
-    return new ReplayPayloadCache({ state: 'pending', promise: key }, preparer);
+    const cache = new ReplayPayloadCache(undefined, preparer);
+    cache.key = { state: 'pending', promise: key };
+    void key.then(
+      (value) => cache.resolveKey(value),
+      (error) => cache.rejectKey(error)
+    );
+    return cache;
   }
 
   /** Start preparing an event as soon as its frame has been decoded. */
@@ -139,13 +126,10 @@ export class ReplayPayloadCache {
 
   /**
    * Start every preparation not already observed from the event stream.
-   * Returns a Promise only when a sealed or portable codec is still running.
+   * Consumers await the few codecs that cannot complete synchronously.
    */
-  prewarm(workflowRun: WorkflowRun, events: Event[]): void | Promise<void> {
-    this.start(
-      this.workflowInputKey(workflowRun.runId),
-      workflowRun.input
-    );
+  prewarm(workflowRun: WorkflowRun, events: Event[]): void {
+    this.start(this.workflowInputKey(workflowRun.runId), workflowRun.input);
     for (
       let index = this.nextUnscannedEventIndex;
       index < events.length;
@@ -154,7 +138,6 @@ export class ReplayPayloadCache {
       this.observeEvent(events[index]);
     }
     this.nextUnscannedEventIndex = events.length;
-    return this.waitForPending();
   }
 
   /** A corrected reload may insert events before the previous scan position. */
@@ -190,11 +173,7 @@ export class ReplayPayloadCache {
       return this.primitiveValues.get(cacheKey);
     }
 
-    const prepared = this.prepareEventPayload(
-      eventId,
-      field,
-      serializedValue
-    );
+    const prepared = this.prepareEventPayload(eventId, field, serializedValue);
     const hydrateAndCache = (payload: PreparedReplayPayload) => {
       const hydrated = hydrate(payload);
       return hydrated instanceof Promise
@@ -207,7 +186,7 @@ export class ReplayPayloadCache {
   }
 
   private cachePrimitive(cacheKey: string, value: unknown): unknown {
-    if (isPrimitive(value)) this.primitiveValues.set(cacheKey, value);
+    if (isCacheablePrimitive(value)) this.primitiveValues.set(cacheKey, value);
     return value;
   }
 
@@ -250,10 +229,8 @@ export class ReplayPayloadCache {
       }
 
       this.preparations.set(cacheKey, { state: 'pending', promise: result });
-      this.pendingPreparations.add(result);
       void result.then(
         (prepared) => {
-          this.pendingPreparations.delete(result);
           const current = this.preparations.get(cacheKey);
           if (current?.state === 'pending' && current.promise === result) {
             this.preparations.set(cacheKey, {
@@ -263,7 +240,6 @@ export class ReplayPayloadCache {
           }
         },
         (error) => {
-          this.pendingPreparations.delete(result);
           const current = this.preparations.get(cacheKey);
           if (current?.state === 'pending' && current.promise === result) {
             this.preparations.set(cacheKey, { state: 'failed', error });
@@ -284,14 +260,26 @@ export class ReplayPayloadCache {
     this.start(cacheKey, value);
     const preparation = this.preparations.get(cacheKey);
     if (!preparation) {
-      throw new Error(`Replay payload preparation was not started: ${cacheKey}`);
+      throw new Error(
+        `Replay payload preparation was not started: ${cacheKey}`
+      );
     }
 
     switch (preparation.state) {
       case 'ready':
         return preparation.value;
       case 'pending':
-        return preparation.promise;
+        return preparation.promise.catch((error) => {
+          const current = this.preparations.get(cacheKey);
+          if (
+            current?.state === 'failed' ||
+            (current?.state === 'pending' &&
+              current.promise === preparation.promise)
+          ) {
+            this.preparations.delete(cacheKey);
+          }
+          throw error;
+        });
       case 'failed':
         this.preparations.delete(cacheKey);
         throw preparation.error;
@@ -301,19 +289,6 @@ export class ReplayPayloadCache {
         }
         return this.key.promise.then(() => this.consume(cacheKey, value));
     }
-  }
-
-  private waitForPending(): void | Promise<void> {
-    if (
-      this.key.state === 'pending' &&
-      [...this.preparations.values()].some(
-        (preparation) => preparation.state === 'waiting'
-      )
-    ) {
-      return this.key.promise.then(() => this.waitForPending());
-    }
-    if (this.pendingPreparations.size === 0) return;
-    return Promise.allSettled([...this.pendingPreparations]).then(() => {});
   }
 
   private resolveKey(value: DecryptionKey | undefined): void {
