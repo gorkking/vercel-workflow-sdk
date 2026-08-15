@@ -568,7 +568,7 @@ wheels = [
 [[package]]
 name = "vercel"
 version = "0.10.0"
-source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=6a10dd4c03457efce22c28986bafecbb925624a7#6a10dd4c03457efce22c28986bafecbb925624a7" }
+source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=c64712f942e6979578257429bca9bf33809819d1#c64712f942e6979578257429bca9bf33809819d1" }
 dependencies = [
     { name = "anyio" },
     { name = "httpx" },
@@ -687,7 +687,7 @@ wheels = [
 [[package]]
 name = "vercel-workflow"
 version = "0.9.0"
-source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel-workflow&rev=6a10dd4c03457efce22c28986bafecbb925624a7#6a10dd4c03457efce22c28986bafecbb925624a7" }
+source = { git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel-workflow&rev=c64712f942e6979578257429bca9bf33809819d1#c64712f942e6979578257429bca9bf33809819d1" }
 dependencies = [
     { name = "anyio" },
     { name = "cbor2" },
@@ -829,6 +829,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
-    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=6a10dd4c03457efce22c28986bafecbb925624a7" },
-    { name = "vercel-workflow", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel-workflow&rev=6a10dd4c03457efce22c28986bafecbb925624a7" },
+    { name = "vercel", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel&rev=c64712f942e6979578257429bca9bf33809819d1" },
+    { name = "vercel-workflow", git = "https://github.com/vercel/vercel-py?subdirectory=src%2Fvercel-workflow&rev=c64712f942e6979578257429bca9bf33809819d1" },
 ]

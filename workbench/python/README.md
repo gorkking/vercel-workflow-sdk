@@ -275,20 +275,30 @@ stops being true fails the run instead of quietly skipping, so growing the file 
 the only way to move. `ConformanceConfig` in `packages/core/e2e/utils.ts` spells
 out each direction.
 
-Current baseline: **32 passing, 105 skipped, of 137** on `world-local` — 27
-fixtures and 3 exempted tests. The Vercel lane collects 19 more tests
+Current baseline: **36 passing, 101 skipped, of 137** on `world-local` — 30
+fixtures and 4 exempted tests. The Vercel lane collects 19 more tests
 (`e2e-agent.test.ts`, which it also picks up and skips whole) and passes one
 fewer, because `deploymentId: 'latest' is a no-op in non-Vercel worlds` is local
 by definition. It is one baseline, not two.
 
-The three exemptions are two upstream causes, and both are ones this lane found
-rather than predicted:
+The four exemptions are three upstream causes, and all three are ones this lane
+found rather than predicted:
 
 - **`hookTokenReuseLoopWorkflow`** — `hook_created` and `hook_disposed` are
   flushed with no ordering between them, so a run conflicts against its own
   disposed hook. The event log says it outright: `hook_created` (round 0),
   `hook_received` (round 0), `hook_conflict` (round 1), `hook_disposed`
   (round 0). That is the shape upstream fixed as #2777 on the TypeScript side.
+- **`concurrent hook token conflict`** — a hook token conflict does not fail the
+  loser, it *hangs* it. The world answers the loser's `hook_created` with a
+  `hook_conflict` event rather than an error, the flush ignores the response, and
+  with the hook still suspended and no `Wait` pending the handler simply returns.
+  Nothing re-delivers, so the log ends at `run_created`, `run_started`,
+  `hook_conflict` and the run sits in `running` — vercel-py *has* a
+  `HookConflictEvent` consumer that raises the right message, it just never gets
+  a delivery to run in. Two smaller things sit behind that one: the error's
+  identity has to survive the log, and `HookConflictEventData` keeps only `token`
+  where TypeScript also carries `conflictingRunId`.
 - **The two `FatalError` tests** — the step *lifecycle* is right, one attempt and
   the run fails on it, but a thrown error does not keep its identity across the
   event log. `step_failed.error` is written as text and comes back as
@@ -309,7 +319,7 @@ every hook fixture outright.
 
 This app is honest about being early. In rough order of how much it costs:
 
-- **Most fixtures are still not ported** — 40 tests across 28 fixtures. What
+- **Most fixtures are still not ported** — 35 tests across 25 fixtures. What
   changed is not the size but the shape: every one now names a missing API, where
   the list used to include "ordinary porting". Two entries that used to be here
   are gone for opposite reasons — streams, because `get_writable()` landed and
@@ -322,21 +332,21 @@ This app is honest about being early. In rough order of how much it costs:
 
   | tests | blocked on |
   | --- | --- |
-  | 18 | hooks — `metadata` on `BaseHook.wait()` (6 alone), `getConflict()` (6 alone), both (4), other (2) |
+  | 12 | hooks — `getConflict()` (6 alone), `getConflict()` + a conflicting run reaching a terminal state (4), other (2) |
   | 9 | `setAttributes` — no Python equivalent at all, and spec version 4, which Python does not claim |
   | 3 | distributed abort |
   | 3 | `start()` or `fetch` from a workflow body — the sandbox denies both by design, so these are not gaps |
-  | 2 | error identity across the event log — the same cause as two of the three exemptions |
+  | 2 | error identity across the event log — the same cause as two of the four exemptions |
   | 2 | invoking a step id that was never registered — see below, it is a gap of its own |
   | 3 | one name each: `RetryableError` + `StepInfo.step_started_at`, `getWorkflowMetadata`, a step returning a `ReadableStream` |
   | 1 | the webhook route |
 
-  **`metadata` is the best-value item on that table by a distance**: 6 tests for
-  one keyword argument. `HookCreatedEventData.metadata` already exists on the
-  wire, the `Hook` entity carries it, and `HookCreatedEvent.payloads()` already
-  puts it in the key-resolution path — the only thing missing is somewhere to
-  *pass* it, since `BaseHook.wait()` takes `token` and nothing else and the flush
-  hard-codes `HookCreatedEventData(token=s.token)`.
+  `metadata` used to head that table at 6 tests for one keyword argument; it
+  landed, and it bought 5 (the sixth needs the conflict handling above). What is
+  left of the hooks row is `getConflict()`, which is not the same size: it needs a
+  suspension kind Python does not have — "commit the hook registration and resume
+  without waiting for a payload" — and, for the four fixtures that adopt or
+  supersede an owner, it needs `conflictingRunId` to stop being parsed away first.
 - **An unregistered step id is a `KeyError`, not a failed step.** Found while
   checking whether `stepNotRegistered{Catchable,Uncaught}` were portable: they are
   not, and the reason is a gap rather than a missing API.

@@ -30,6 +30,8 @@ import re
 import time
 from typing import Any, Awaitable, TypeVar
 
+import pydantic
+
 from vercel.workflow import (
     BaseHook,
     FatalError,
@@ -901,4 +903,91 @@ async def retainedInterleavingWorkflow(token: str) -> dict:
         "winner": winner,
         "g": g,
         "h": h,
+    }
+
+
+##########################################################
+# hookWorkflow — 99_e2e.ts:126
+# hookCleanupTestWorkflow — 99_e2e.ts:628
+# hookDisposeTestWorkflow — 99_e2e.ts:946
+#
+# The three fixtures that needed hook *metadata* and nothing else. Metadata is
+# how a run tells its resumer what it is waiting for: attached once when the hook
+# is registered, read back off the hook entity rather than out of a payload. The
+# suite leans on it hard — `hookWorkflow`'s driver resumes with
+# `customData: hook.metadata?.customData` and then asserts the workflow saw that
+# exact value, so a missing metadata field does not weaken the test, it fails it.
+#
+# `hookWorkflow`'s payload is a **pydantic model** rather than a dataclass, and
+# that is load-bearing rather than a style choice. The driver sends `done` only
+# on the last payload, and the test asserts the first two come back with `done`
+# *absent* — `undefined`, not `false` and not `null`. A dataclass materializes
+# every optional field, so `dataclasses.asdict` would report `done: None` and the
+# assertion would fail on the difference between "not sent" and "sent as null".
+# `model_dump(exclude_unset=True)` reproduces what the resumer actually sent,
+# which is the property the test is really about. The other two fixtures have no
+# optional fields and stay dataclasses.
+#
+# `using hook` becomes an explicit `dispose()` on the normal path — never a
+# `finally`; see the hook cluster above for why. Where that dispose lands matters
+# only in `hookDisposeTestWorkflow`, and there it is the whole point: it releases
+# the token *before* the 5s sleep, so another run can claim it while this one is
+# still going. In the other two the run completes right after, which frees the
+# token anyway, so the call is a formality kept for symmetry with the fixture.
+
+
+class HookPayload(BaseHook, pydantic.BaseModel):
+    message: str
+    customData: str
+    done: bool | None = None
+
+
+@app.workflow
+async def hookWorkflow(token: str, customData: str) -> list:
+    hook = HookPayload.wait(token=token, metadata={"customData": customData})
+
+    payloads = []
+    async for payload in hook:
+        payloads.append(payload.model_dump(exclude_unset=True))
+        if payload.done:
+            break
+
+    hook.dispose()
+    return payloads
+
+
+@dataclasses.dataclass
+class MessagePayload(BaseHook):
+    message: str
+    customData: str
+
+
+@app.workflow
+async def hookCleanupTestWorkflow(token: str, customData: str) -> dict:
+    hook = MessagePayload.wait(token=token, metadata={"customData": customData})
+    payload = await hook
+    hook.dispose()
+    return {
+        "message": payload.message,
+        "customData": payload.customData,
+        "hookCleanupTestData": "workflow_completed",
+    }
+
+
+@app.workflow
+async def hookDisposeTestWorkflow(token: str, customData: str) -> dict:
+    hook = MessagePayload.wait(token=token, metadata={"customData": customData})
+    payload = await hook
+    message, customDataResult = payload.message, payload.customData
+
+    # Releases the token here rather than at run completion, which is what lets
+    # the test's second run claim it while this one is still sleeping.
+    hook.dispose()
+    await sleep("5s")
+
+    return {
+        "message": message,
+        "customData": customDataResult,
+        "disposed": True,
+        "hookDisposeTestData": "workflow_completed",
     }
