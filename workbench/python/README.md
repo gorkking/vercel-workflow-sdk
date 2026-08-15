@@ -275,7 +275,7 @@ stops being true fails the run instead of quietly skipping, so growing the file 
 the only way to move. `ConformanceConfig` in `packages/core/e2e/utils.ts` spells
 out each direction.
 
-Current baseline: **29 passing, 108 skipped, of 137** on `world-local` — 24
+Current baseline: **32 passing, 105 skipped, of 137** on `world-local` — 27
 fixtures and 3 exempted tests. The Vercel lane collects 19 more tests
 (`e2e-agent.test.ts`, which it also picks up and skips whole) and passes one
 fewer, because `deploymentId: 'latest' is a no-op in non-Vercel worlds` is local
@@ -309,31 +309,45 @@ every hook fixture outright.
 
 This app is honest about being early. In rough order of how much it costs:
 
-- **Most fixtures are still not ported** — roughly 39 tests across 31 fixtures.
-  What changed is not the size but the shape: every one of them now names a
-  missing API, where the list used to include "ordinary porting". Streams are
-  gone from it entirely (`get_writable` landed and three fixtures use it), and so
-  is the largest old entry — hooks were said to need a design decision because
-  `BaseHook.wait()` "has a different shape than the async-iterable hook the
-  fixtures use", which is simply not so: `HookEvent` implements `__await__` *and*
-  `__aiter__` / `__anext__`, so `for await (const p of hook)` ports to
-  `async for payload in hook` unchanged, and four hook fixtures are in on that
-  basis.
+- **Most fixtures are still not ported** — 40 tests across 28 fixtures. What
+  changed is not the size but the shape: every one now names a missing API, where
+  the list used to include "ordinary porting". Two entries that used to be here
+  are gone for opposite reasons — streams, because `get_writable()` landed and
+  five fixtures use it now, including two that forward a writable into a child
+  run; and hooks-as-a-design-problem, because that premise was wrong (`HookEvent`
+  is both awaitable and async-iterable, so `for await (const p of hook)` ports
+  unchanged, and five hook fixtures are in).
 
-  What is left, by size: hooks again (11 fixtures / 15 tests) but for two named
-  things — `metadata` on `BaseHook.wait()`, where the wire model
-  `HookCreatedEventData` already carries the field and only the authoring API
-  cannot fill it, and a `getConflict()` equivalent, which also needs
-  `hook_conflict`'s `conflictingRunId` to stop being parsed away. Then
-  `setAttributes` (9 tests, no Python equivalent at all, and spec version 4,
-  which Python does not claim), distributed abort (3), and single names:
-  `RetryableError`, `getWorkflowMetadata`, a `ReadableStream` returned from a
-  step, and invoking a step id that was never registered.
+  What is left, largest first:
 
-  Three fixtures are unportable by design rather than by gap: `fetchWorkflow` and
-  the two that call `start()` from a workflow body do what the Python sandbox
-  denies on purpose. `spawnWorkflowFromStepWorkflow` is the supported shape and is
-  ported.
+  | tests | blocked on |
+  | --- | --- |
+  | 18 | hooks — `metadata` on `BaseHook.wait()` (6 alone), `getConflict()` (6 alone), both (4), other (2) |
+  | 9 | `setAttributes` — no Python equivalent at all, and spec version 4, which Python does not claim |
+  | 3 | distributed abort |
+  | 3 | `start()` or `fetch` from a workflow body — the sandbox denies both by design, so these are not gaps |
+  | 2 | error identity across the event log — the same cause as two of the three exemptions |
+  | 2 | invoking a step id that was never registered — see below, it is a gap of its own |
+  | 3 | one name each: `RetryableError` + `StepInfo.step_started_at`, `getWorkflowMetadata`, a step returning a `ReadableStream` |
+  | 1 | the webhook route |
+
+  **`metadata` is the best-value item on that table by a distance**: 6 tests for
+  one keyword argument. `HookCreatedEventData.metadata` already exists on the
+  wire, the `Hook` entity carries it, and `HookCreatedEvent.payloads()` already
+  puts it in the key-resolution path — the only thing missing is somewhere to
+  *pass* it, since `BaseHook.wait()` takes `token` and nothing else and the flush
+  hard-codes `HookCreatedEventData(token=s.token)`.
+- **An unregistered step id is a `KeyError`, not a failed step.** Found while
+  checking whether `stepNotRegistered{Catchable,Uncaught}` were portable: they are
+  not, and the reason is a gap rather than a missing API.
+  `Workflows._get_step` is `return self._steps[step_name]`, called *before* the
+  `try` that writes `step_failed`, so an unknown name raises out of the queue
+  handler and the delivery 500s. TypeScript raises a `StepNotRegisteredError` that
+  fails the step with "is not registered", which is what lets the workflow catch
+  it and the run complete — which is exactly what those two tests assert. Worth
+  more than its two tests: in a real app this is what a bundling mistake looks
+  like, and the difference between the two behaviours is a clear failed run versus
+  an endless redelivery loop.
 - **The `.well-known/workflow/v1` surface lives in `app.py`, not the SDK**, and
   reaching it needs three `vercel.workflow._internal` imports
   (`workflow_entrypoint`, `FLOW_ROUTE`, and the `HTTPRequest` base), none of

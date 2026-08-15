@@ -26,13 +26,16 @@
     "promiseAnyWorkflow",
     "promiseRaceStressTestWorkflow",
     "promiseRaceWorkflow",
+    "retainedInterleavingWorkflow",
     "sleepInLoopWorkflow",
     "sleepWinsRaceWorkflow",
     "sleepWithSequentialStepsWorkflow",
     "sleepingWorkflow",
     "spawnWorkflowFromStepWorkflow",
     "stepWinsRaceWorkflow",
-    "utf8StreamWorkflow"
+    "utf8StreamWorkflow",
+    "writableForwardedFromStepWorkflow",
+    "writableForwardedFromWorkflowWorkflow"
   ],
   "unsupported": {
     "hookTokenReuseLoopWorkflow - same run recreates a hook with the same token after dispose()": "vercel-py flushes `hook_created` and `hook_disposed` from one task group with no ordering between them, so a run conflicts against its own disposed hook \u2014 the shape upstream fixed as vercel/workflow#2777. Confirmed by the event log rather than read off the code: `hook_created` (round 0), `hook_received` (round 0), `hook_conflict` (round 1), `hook_disposed` (round 0) \u2014 round 1's registration was validated a beat before round 0's disposal landed. The failure the driver reports is downstream of that: the fixture returns early on the conflict, so the hook it was waiting for is gone and `waitForHook` 404s with `HookNotFoundError`.",

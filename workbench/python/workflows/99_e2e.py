@@ -774,3 +774,131 @@ async def sleepWithSequentialStepsWorkflow() -> dict:
     b = await addNumbers(a, 3)
     c = await addNumbers(b, 4)
     return {"a": a, "b": b, "c": c, "shouldCancel": shouldCancel}
+
+
+##########################################################
+# writableForwardedFromWorkflowWorkflow — 99_e2e.ts:3515
+# writableForwardedFromStepWorkflow — 99_e2e.ts:3540
+#
+# A stream reference crossing a *run* boundary: the parent hands its writable to
+# a child run as part of that run's input, and the driver then reads the bytes
+# off the **parent's** stream. So the handle has to survive `start()`'s input
+# serialization, arrive in another run's body, and still name the stream it came
+# from rather than the child's own — which is why `WorkflowStreamHandle` carries
+# a run id instead of deriving one from the ambient run.
+#
+# The two variants differ in where the parent's `get_writable()` is called, and
+# they are not the same path through the SDK. Variant 1 calls it in the workflow
+# body, so a *handle* is serialized into a step's arguments, revived there as a
+# writer, and serialized again into the child's input. Variant 2 calls it inside
+# the step that also calls `start()`, so what gets forwarded is the step-context
+# writer directly. Both have to land on the same stream.
+#
+# `start()` lives in a step for the usual reason: it is a world write, and the
+# workflow body replays with no network. The TypeScript fixture says the same
+# thing in a comment, which is a good sign the restriction is protocol-shaped
+# rather than Python-shaped.
+
+
+@app.step
+async def writeBytesToWritable(writable: WorkflowWritable, payload: str) -> None:
+    await writable.write(payload.encode())
+
+
+@app.workflow
+async def writableForwardedChildWorkflow(
+    parentWritable: WorkflowWritable, payload: str
+) -> str:
+    await writeBytesToWritable(parentWritable, payload)
+    return "child-done"
+
+
+@app.step
+async def startChildWithWorkflowWritable(
+    parentWritable: WorkflowWritable, payload: str
+) -> str:
+    childRun = await start(writableForwardedChildWorkflow, parentWritable, payload)
+    # Let the child finish writing before the parent is allowed to close.
+    await childRun.return_value()
+    return childRun.run_id
+
+
+@app.workflow
+async def writableForwardedFromWorkflowWorkflow(payload: str) -> dict:
+    writable = get_writable()
+    childRunId = await startChildWithWorkflowWritable(writable, payload)
+    await stepCloseOutputStream(writable)
+    return {"childRunId": childRunId}
+
+
+@app.step
+async def startChildWithStepWritable(payload: str) -> str:
+    writable = get_writable()
+    childRun = await start(writableForwardedChildWorkflow, writable, payload)
+    await childRun.return_value()
+    await writable.close()
+    return childRun.run_id
+
+
+@app.workflow
+async def writableForwardedFromStepWorkflow(payload: str) -> dict:
+    return {"childRunId": await startChildWithStepWritable(payload)}
+
+
+##########################################################
+# retainedInterleavingWorkflow — 99_e2e.ts:264
+#
+# Every suspension kind this app can produce, in one body, with the exact
+# composite result asserted — so a dropped, duplicated or misordered boundary
+# fails loudly rather than shifting a number nobody checks.
+#
+# Upstream wrote it for VM retention (`WORKFLOW_RETAINED_VM`): primitive step
+# arguments keep the retained VM, a non-primitive argument demotes the boundary
+# to a cold replay. Python has no such VM, so `unwrapValue`'s object argument is
+# just an object argument here. That does not make the fixture pointless on this
+# side — what the test actually asserts is that nine values come back right
+# across a step / gather / race / sleep / hook interleaving, and that is the
+# same claim in any language.
+#
+# The hook is created with a token and no metadata, which is the one hook shape
+# vercel-py can express today, and it is awaited *concurrently with a step* —
+# `asyncio.gather(hook, add(...))`, since `HookEvent` is awaitable. Dispose on
+# the normal path only; see the hook cluster above for why `finally` would break
+# it.
+
+
+@app.step
+async def unwrapValue(box: dict) -> int:
+    return box["value"]
+
+
+@dataclasses.dataclass
+class DeltaPayload(BaseHook):
+    delta: int
+
+
+@app.workflow
+async def retainedInterleavingWorkflow(token: str) -> dict:
+    a = await add(1, 2)
+    b = await unwrapValue({"value": a})
+    c, d = await asyncio.gather(add(b, 10), add(b, 20))
+    e, f = await asyncio.gather(unwrapValue({"value": c}), add(d, 1))
+    winner = await _race(delayMsStep(100, "step"), _sleepThen("30s", "sleep"))
+    await sleep("1s")
+
+    hook = DeltaPayload.wait(token=token)
+    payload, g = await asyncio.gather(hook, add(e + f, 100))
+    h = await add(g, payload.delta)
+    hook.dispose()
+
+    return {
+        "a": a,
+        "b": b,
+        "c": c,
+        "d": d,
+        "e": e,
+        "f": f,
+        "winner": winner,
+        "g": g,
+        "h": h,
+    }
