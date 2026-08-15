@@ -275,14 +275,13 @@ stops being true fails the run instead of quietly skipping, so growing the file 
 the only way to move. `ConformanceConfig` in `packages/core/e2e/utils.ts` spells
 out each direction.
 
-Current baseline: **36 passing, 101 skipped, of 137** on `world-local` — 30
-fixtures and 4 exempted tests. The Vercel lane collects 19 more tests
+Current baseline: **44 passing, 93 skipped, of 137** on `world-local` — 37
+fixtures and 6 exempted tests. The Vercel lane collects 19 more tests
 (`e2e-agent.test.ts`, which it also picks up and skips whole) and passes one
 fewer, because `deploymentId: 'latest' is a no-op in non-Vercel worlds` is local
 by definition. It is one baseline, not two.
 
-The four exemptions are three upstream causes, and all three are ones this lane
-found rather than predicted:
+The six exemptions are four causes:
 
 - **`hookTokenReuseLoopWorkflow`** — `hook_created` and `hook_disposed` are
   flushed with no ordering between them, so a run conflicts against its own
@@ -299,7 +298,16 @@ found rather than predicted:
   a delivery to run in. Two smaller things sit behind that one: the error's
   identity has to survive the log, and `HookConflictEventData` keeps only `token`
   where TypeScript also carries `conflictingRunId`.
-- **The two `FatalError` tests** — the step *lifecycle* is right, one attempt and
+- **`validation DX`** — the one exemption that is not a runtime gap at all. Seven
+  of its eight assertions pass: every rule is enforced, at the call site, as a
+  catchable `FatalError`, with the limit in the message. The two that fail want
+  JavaScript *vocabulary* — `allowReservedAttributes` against a message that
+  correctly names the Python parameter `allow_reserved_attributes`, and
+  `requires a plain object` against `requires a mapping, got str`. Same situation
+  as `workflowCoreVersion` in the health-check tests: the assertion is coupled to
+  one SDK's spelling of its own API. Asserting the rule and the limit instead
+  would make it portable with no runtime change.
+- **The two `FatalError` tests, and now a third** — the step *lifecycle* is right, one attempt and
   the run fails on it, but a thrown error does not keep its identity across the
   event log. `step_failed.error` is written as text and comes back as
   `RuntimeError`, so the workflow's `except` sees no `FatalError` and the failed
@@ -319,7 +327,7 @@ every hook fixture outright.
 
 This app is honest about being early. In rough order of how much it costs:
 
-- **Most fixtures are still not ported** — 35 tests across 25 fixtures. What
+- **Most fixtures are still not ported** — 25 tests across 18 fixtures. What
   changed is not the size but the shape: every one now names a missing API, where
   the list used to include "ordinary porting". Two entries that used to be here
   are gone for opposite reasons — streams, because `get_writable()` landed and
@@ -333,20 +341,20 @@ This app is honest about being early. In rough order of how much it costs:
   | tests | blocked on |
   | --- | --- |
   | 12 | hooks — `getConflict()` (6 alone), `getConflict()` + a conflicting run reaching a terminal state (4), other (2) |
-  | 9 | `setAttributes` — no Python equivalent at all, and spec version 4, which Python does not claim |
   | 3 | distributed abort |
   | 3 | `start()` or `fetch` from a workflow body — the sandbox denies both by design, so these are not gaps |
-  | 2 | error identity across the event log — the same cause as two of the four exemptions |
+  | 2 | error identity across the event log — the same cause as three of the six exemptions |
   | 2 | invoking a step id that was never registered — see below, it is a gap of its own |
-  | 3 | one name each: `RetryableError` + `StepInfo.step_started_at`, `getWorkflowMetadata`, a step returning a `ReadableStream` |
+  | 2 | one name each: `getWorkflowMetadata`, a step returning a `ReadableStream` |
   | 1 | the webhook route |
 
-  `metadata` used to head that table at 6 tests for one keyword argument; it
-  landed, and it bought 5 (the sixth needs the conflict handling above). What is
-  left of the hooks row is `getConflict()`, which is not the same size: it needs a
-  suspension kind Python does not have — "commit the hook registration and resume
-  without waiting for a payload" — and, for the four fixtures that adopt or
-  supersede an owner, it needs `conflictingRunId` to stop being parsed away first.
+Two whole rows left that table in one pin. `setAttributes` was 9 tests and is
+  now 8 passing plus one exemption on wording, and `RetryableError` was the last
+  of the retry block. What is left of the hooks row is `getConflict()`, which is
+  not `metadata`'s size: it needs a suspension kind Python does not have — commit
+  the hook registration and resume *without* waiting for a payload — and, for the
+  four fixtures that adopt or supersede an owner, it needs `conflictingRunId` to
+  stop being parsed away first.
 - **An unregistered step id is a `KeyError`, not a failed step.** Found while
   checking whether `stepNotRegistered{Catchable,Uncaught}` were portable: they are
   not, and the reason is a gap rather than a missing API.

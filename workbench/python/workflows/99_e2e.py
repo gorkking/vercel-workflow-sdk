@@ -28,6 +28,7 @@ import json
 import random
 import re
 import time
+from datetime import UTC, datetime
 from typing import Any, Awaitable, TypeVar
 
 import pydantic
@@ -35,11 +36,13 @@ import pydantic
 from vercel.workflow import (
     BaseHook,
     FatalError,
+    RetryableError,
     Run,
     WorkflowWritable,
     Workflows,
     get_step_metadata,
     get_writable,
+    set_attributes,
     sleep,
     start,
     time_ns,
@@ -991,3 +994,139 @@ async def hookDisposeTestWorkflow(token: str, customData: str) -> dict:
         "disposed": True,
         "hookDisposeTestData": "workflow_completed",
     }
+
+
+##########################################################
+# errorRetryCustomDelay — 99_e2e.ts:1314
+#
+# The third of the TypeScript retry block's fixtures, and the one that needed
+# two things at once: `RetryableError(retry_after=…)` to steer the wait, and
+# `StepInfo.step_started_at` to measure it. `step_started_at` is when the
+# *first* attempt began, so `now - step_started_at` on attempt 2 is how long the
+# step has been going across the retry — which is what the test bounds at 10s.
+#
+# Wall clock rather than the workflow clock, because this runs in a step: the
+# deterministic clock is a replay construct and would report the same instant on
+# both attempts.
+
+
+@app.step
+async def throwRetryableError() -> dict:
+    metadata = get_step_metadata()
+    if metadata.attempt == 1:
+        raise RetryableError("Retryable error", retry_after="10s")
+    started = metadata.step_started_at
+    return {
+        "attempt": metadata.attempt,
+        "duration": int(datetime.now(UTC).timestamp() * 1000 - started.timestamp() * 1000),
+    }
+
+
+@app.workflow
+async def errorRetryCustomDelay() -> dict:
+    return await throwRetryableError()
+
+
+##########################################################
+# setAttributesWorkflow — 99_e2e.ts:3555
+# setAttributesInsideStepWorkflow — 99_e2e.ts:3582
+# setAttributesFireAndForgetWorkflow — 99_e2e.ts:3593
+# setAttributesParallelWorkflow — 99_e2e.ts:3609
+# setAttributesThrowsAfterWorkflow — 99_e2e.ts:3624
+# setAttributesValidationWorkflow — 99_e2e.ts:3639
+#
+# Plaintext key/value metadata on the run, and the whole `setAttributes` block in
+# one go now that `set_attributes()` exists. Six fixtures covering the axes the
+# implementation can get wrong independently: from the workflow body, from a step
+# body, unawaited, concurrently over disjoint keys, on a run that then fails, and
+# with every input the validator is supposed to reject.
+#
+# Two Python-shaped details, neither of them a workaround:
+#
+# - **`undefined` is `None`.** `setAttributes({ source: undefined })` removes the
+#   key; the Python spelling is `{"source": None}`, which is what the SDK's
+#   `Mapping[str, str | None]` signature already says.
+# - **Fire-and-forget is not awaiting.** `set_attributes()` returns an awaitable
+#   and, in a workflow body, records the write when *called* — so dropping the
+#   return value is the `void setAttributes(...)` of the TypeScript fixture, and
+#   the write still lands at the next suspension. Leaving an awaitable
+#   un-awaited is normally a Python smell, so it gets a comment at the call site
+#   rather than only here.
+
+
+@app.workflow
+async def setAttributesWorkflow(input: int) -> int:
+    await set_attributes({"phase": "init", "source": "workflow-body"})
+    tripled = input * 3
+    await set_attributes({"phase": "done"})
+    # `None` removes the key, the way `undefined` does on the TypeScript side.
+    await set_attributes({"source": None})
+    return tripled
+
+
+@app.step
+async def setAttributesFromStep(input: int) -> int:
+    await set_attributes(
+        {"phase": "step-started", "source": "step-body", "input": str(input)}
+    )
+    await set_attributes({"phase": "step-done"})
+    return input * 4
+
+
+@app.workflow
+async def setAttributesInsideStepWorkflow(input: int) -> int:
+    return await setAttributesFromStep(input)
+
+
+@app.workflow
+async def setAttributesFireAndForgetWorkflow() -> str:
+    # Deliberately not awaited: in a workflow body the call itself records the
+    # write, so this is `void setAttributes(...)` and the value lands at the next
+    # suspension. noqa-worthy on sight, correct on purpose.
+    set_attributes({"phase": "init", "mode": "fire-and-forget"})
+    await sleep("100ms")
+    set_attributes({"phase": "mid"})
+    await sleep("100ms")
+    set_attributes({"phase": "done"})
+    return "completed"
+
+
+@app.workflow
+async def setAttributesParallelWorkflow() -> str:
+    await asyncio.gather(
+        set_attributes({"a": "1"}),
+        set_attributes({"b": "2"}),
+        set_attributes({"c": "3"}),
+    )
+    return "done"
+
+
+@app.workflow
+async def setAttributesThrowsAfterWorkflow() -> None:
+    await set_attributes({"phase": "about-to-fail", "reason": "intentional"})
+    raise FatalError("intentional failure to test attribute persistence")
+
+
+@app.workflow
+async def setAttributesValidationWorkflow() -> dict:
+    outcomes = {}
+
+    async def attempt(label: str, attrs) -> None:
+        try:
+            await set_attributes(attrs)
+            outcomes[label] = "no-error"
+        except Exception as e:
+            outcomes[label] = f"{type(e).__name__}: {e}"
+
+    await attempt("reserved", {"$system": "nope"})
+    await attempt("emptyKey", {"": "v"})
+    await attempt("keyTooLong", {"k" * 257: "v"})
+    await attempt("valueTooLong", {"note": "v" * 257})
+    # The cap is bytes, not characters: 200 two-byte characters is 400 bytes.
+    await attempt("valueTooManyBytes", {"note": "é" * 200})
+    await attempt("overCap", {f"k{i}": "v" for i in range(65)})
+    await attempt("nonObject", "phase=init")
+
+    # The run must remain healthy after every rejected call.
+    await set_attributes({"phase": "validated"})
+    return outcomes
