@@ -275,13 +275,13 @@ stops being true fails the run instead of quietly skipping, so growing the file 
 the only way to move. `ConformanceConfig` in `packages/core/e2e/utils.ts` spells
 out each direction.
 
-Current baseline: **44 passing, 93 skipped, of 137** on `world-local` — 37
-fixtures and 6 exempted tests. The Vercel lane collects 19 more tests
+Current baseline: **48 passing, 89 skipped, of 137** on `world-local` — 37
+fixtures and 5 exempted tests. The Vercel lane collects 19 more tests
 (`e2e-agent.test.ts`, which it also picks up and skips whole) and passes one
 fewer, because `deploymentId: 'latest' is a no-op in non-Vercel worlds` is local
 by definition. It is one baseline, not two.
 
-The six exemptions are four causes:
+The five exemptions are three causes:
 
 - **`hookTokenReuseLoopWorkflow`** — `hook_created` and `hook_disposed` are
   flushed with no ordering between them, so a run conflicts against its own
@@ -298,15 +298,6 @@ The six exemptions are four causes:
   a delivery to run in. Two smaller things sit behind that one: the error's
   identity has to survive the log, and `HookConflictEventData` keeps only `token`
   where TypeScript also carries `conflictingRunId`.
-- **`validation DX`** — the one exemption that is not a runtime gap at all. Seven
-  of its eight assertions pass: every rule is enforced, at the call site, as a
-  catchable `FatalError`, with the limit in the message. The two that fail want
-  JavaScript *vocabulary* — `allowReservedAttributes` against a message that
-  correctly names the Python parameter `allow_reserved_attributes`, and
-  `requires a plain object` against `requires a mapping, got str`. Same situation
-  as `workflowCoreVersion` in the health-check tests: the assertion is coupled to
-  one SDK's spelling of its own API. Asserting the rule and the limit instead
-  would make it portable with no runtime change.
 - **The two `FatalError` tests, and now a third** — the step *lifecycle* is right, one attempt and
   the run fails on it, but a thrown error does not keep its identity across the
   event log. `step_failed.error` is written as text and comes back as
@@ -371,14 +362,16 @@ Two whole rows left that table in one pin. `setAttributes` was 9 tests and is
   (`workflow_entrypoint`, `FLOW_ROUTE`, and the `HTTPRequest` base), none of
   which has a public equivalent. The module docstring explains why that surface
   belongs in the app.
-- **The health-check tests stay JS-only, but no longer for want of an
-  implementation.** vercel-py answers both probes as of `vercel-py#292` — the
-  `?__health` one inside `workflow_entrypoint` (so `app.py` only routes to it)
-  and the queue-based one in `workflow_handler`. What the driver additionally
-  asserts is a `workflowCoreVersion` string, which Python deliberately omits
-  because it names a JavaScript package's version and the reader feeds it to
-  that package's capability tables. Moving the three tests across means deciding
-  what a non-JS SDK should report there.
+- ~~The health-check tests stay JS-only~~ **They run here now.** vercel-py
+  answers both probes as of `vercel-py#292` — the `?__health` one inside
+  `workflow_entrypoint` (so `app.py` only routes to it) and the queue-based one
+  in `workflow_handler` — and the suite no longer requires the two things that
+  are JavaScript's rather than the protocol's: a `workflowCoreVersion` string
+  (an npm package's version, which an SDK in another language has nothing to put
+  in) and a spec version at least as new as the *driver's* (true for an app built
+  from the same `@workflow/core`, not for an implementation that honestly reports
+  what it writes). Both are now asserted for JS apps and relaxed for everyone
+  else, which is what took these three out of `testJsOnly`.
 - **No webhook route and no app-specific API routes**, so the webhook and
   direct-step-call tests are JS-only too.
 

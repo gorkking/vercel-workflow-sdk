@@ -134,10 +134,11 @@ const e2e = (fn: string) => {
  * mean testing something else, so a non-JS app skips them instead of carrying
  * them as gaps.
  *
- * A handful of markers are weaker than that: health check, the webhook route, and
- * app-provided API routes are protocol-level and *ought* to travel, but no other
- * SDK serves them yet, so there is nothing to conform to. Those sites say so, and
- * should move back to plain `test` as soon as a second implementation lands.
+ * A handful of markers are weaker than that: the webhook route and app-provided
+ * API routes are protocol-level and *ought* to travel, but no other SDK serves
+ * them yet, so there is nothing to conform to. Those sites say so, and should
+ * move back to plain `test` as soon as a second implementation lands — which is
+ * what the three health-check tests just did.
  *
  * Every test not marked here is in scope for cross-language conformance, and is
  * gated only by `e2e-conformance.json`. No-op for the JS workbench apps.
@@ -2680,12 +2681,14 @@ describe('e2e', () => {
   // For production use on Vercel with Deployment Protection enabled, use the
   // queue-based `healthCheck(world, options)` function instead, which
   // bypasses protection by sending messages through the Queue infrastructure.
-  // JS-only for now, though no longer for want of a second implementation:
-  // vercel-py answers both probes as of vercel-py#292. What it omits is
-  // `workflowCoreVersion`, asserted below, on the grounds that it names a
-  // JavaScript package's version. Moving all three health-check tests out of
-  // js-only together means settling what a non-JS SDK reports there.
-  testJsOnly.skipIf(!isLocalDeployment())(
+  // No longer js-only: vercel-py answers both probes as of vercel-py#292, and
+  // the one field that was holding these back — `workflowCoreVersion` — is
+  // genuinely JavaScript-specific, since it names an npm package's version and
+  // its reader feeds it to that package's capability tables. An SDK in another
+  // language has nothing to put there, so it is asserted where it applies
+  // rather than required of everyone. Everything else in the payload is
+  // protocol and is asserted for every app.
+  test.skipIf(!isLocalDeployment())(
     'health check endpoint (HTTP) - workflow endpoint responds to __health query parameter',
     { timeout: 30_000 },
     async () => {
@@ -2707,20 +2710,32 @@ describe('e2e', () => {
       expect(flowRes.status).toBe(200);
       expect(flowRes.headers.get('Content-Type')).toBe('application/json');
       const flowBody = await flowRes.json();
-      expect(flowBody).toEqual({
+      const { workflowCoreVersion, ...protocolFields } = flowBody;
+      expect(protocolFields).toEqual({
         healthy: true,
         endpoint: '/.well-known/workflow/v1/flow',
         // specVersion comes from the World's declared specVersion (e.g. 3
         // for world-vercel) or falls back to SPEC_VERSION_CURRENT (2).
         specVersion: expect.any(Number),
-        workflowCoreVersion: expect.any(String),
       });
-      expect(flowBody.specVersion).toBeGreaterThanOrEqual(SPEC_VERSION_CURRENT);
+      // A JavaScript app is built from the same `@workflow/core` as this driver,
+      // so advertising an older spec version than the library it ships with is a
+      // regression. A second implementation's spec version is its own: it
+      // reports what it *writes*, which vercel-py deliberately keeps at 2 while
+      // reading up to 6, so the only portable claim is that it is a real version.
+      if (isJsApp()) {
+        expect(flowBody.specVersion).toBeGreaterThanOrEqual(
+          SPEC_VERSION_CURRENT
+        );
+        expect(typeof workflowCoreVersion).toBe('string');
+      } else {
+        expect(flowBody.specVersion).toBeGreaterThanOrEqual(1);
+      }
       // V2: no separate step endpoint — combined into the flow handler.
     }
   );
 
-  testJsOnly(
+  test(
     'health check (queue-based) - workflow endpoint responds to health check messages',
     { timeout: 60_000 },
     async () => {
@@ -2734,14 +2749,17 @@ describe('e2e', () => {
         timeout: 30000,
       });
       expect(workflowResult.healthy).toBe(true);
-      // The deployed app advertises its `@workflow/core` version so
-      // callers can derive capability metadata (see `getRunCapabilities`
-      // in `capabilities.ts`).
-      expect(typeof workflowResult.workflowCoreVersion).toBe('string');
+      // A JavaScript app advertises its `@workflow/core` version so callers can
+      // derive capability metadata (see `getRunCapabilities` in
+      // `capabilities.ts`). An SDK in another language has no such package, and
+      // the field is optional in the payload for that reason.
+      if (isJsApp()) {
+        expect(typeof workflowResult.workflowCoreVersion).toBe('string');
+      }
     }
   );
 
-  testJsOnly(
+  test(
     'health check (CLI) - workflow health command reports healthy endpoints',
     { timeout: 60_000 },
     async () => {
@@ -4479,7 +4497,13 @@ describe('e2e', () => {
         // catch, with a message naming the violated rule and its limit.
         expect(outcomes.reserved).toMatch(/^FatalError: /);
         expect(outcomes.reserved).toContain('reserved prefix');
-        expect(outcomes.reserved).toContain('allowReservedAttributes');
+        // The message names the opt-out parameter, and each SDK names it in its
+        // own casing — `allowReservedAttributes` here, `allow_reserved_attributes`
+        // in Python. Assert that it points at the escape hatch, not how one
+        // language spells it.
+        expect(outcomes.reserved).toMatch(
+          /allow[_]?[rR]eserved[_]?[aA]ttributes/
+        );
         expect(outcomes.emptyKey).toContain('must not be empty');
         expect(outcomes.keyTooLong).toContain(
           'key length 257 exceeds limit 256'
@@ -4492,7 +4516,10 @@ describe('e2e', () => {
           'byte length 400 exceeds limit 256'
         );
         expect(outcomes.overCap).toContain('exceed limit 64');
-        expect(outcomes.nonObject).toContain('requires a plain object');
+        // Same idea: "plain object" in JS is "mapping" in Python. What the test
+        // is for is that a non-object argument is rejected by name at the call
+        // site, which either wording satisfies.
+        expect(outcomes.nonObject).toMatch(/requires a (plain object|mapping)/);
 
         // No invalid write reached the run, and the run stayed healthy
         // enough to complete a valid write afterwards.
