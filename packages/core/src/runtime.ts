@@ -528,7 +528,7 @@ type RetentionDecision =
       reason:
         | 'disabled'
         | 'serialization_executed_workflow_code'
-        | 'no_step_driver'
+        | 'no_replay_driver'
         | 'unsupported_suspension_item'
         | 'open_wait';
     };
@@ -538,9 +538,9 @@ type RetentionDecision =
  *
  * Every item type accepted here must use the suspension-generation guard when
  * signaling. Otherwise a signal scheduled at boundary N could suspend the VM
- * after it has already resumed into boundary N+1. Waits and attributes are not
- * guarded, so they remain unretainable. A step is required to drive the next
- * inline iteration; hook-only suspensions park normally.
+ * after it has already resumed into boundary N+1. Waits are not guarded, so
+ * they remain unretainable. A step or attribute write is required to drive the
+ * next inline iteration; hook-only suspensions park normally.
  *
  * `hasOpenWait` is lazy because checking it scans the loaded event log. Keep it
  * last so cheap rejection reasons avoid that work.
@@ -563,17 +563,17 @@ function getRetentionDecision({
       reason: 'serialization_executed_workflow_code',
     };
   }
-  if (suspension.stepCount === 0) {
-    return { retain: false, reason: 'no_step_driver' };
+  if (suspension.stepCount === 0 && suspension.attributeCount === 0) {
+    return { retain: false, reason: 'no_replay_driver' };
   }
   if (
     !suspension.items.every((item) => {
       switch (item.type) {
         case 'step':
         case 'hook':
+        case 'attribute':
           return true;
         case 'wait':
-        case 'attribute':
           return false;
         default:
           item satisfies never;
