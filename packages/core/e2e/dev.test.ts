@@ -1097,7 +1097,7 @@ ${apiFileContent}`
         };
 
         let snapshot = await waitForGeneratedArtifactStability();
-        const expectedBodyOnlyRebuild = finalConfig.canary
+        const expectedHotRebuild = finalConfig.canary
           ? ('any' as const)
           : { hot: 1 };
         const cases = [
@@ -1156,7 +1156,7 @@ export async function hmrFuzzWorkflow() {
           {
             file: files.workflowHelper,
             kind: 'workflow',
-            expectedLogCounts: expectedBodyOnlyRebuild,
+            expectedLogCounts: expectedHotRebuild,
             expectedWorkflowValue: (iteration: number) =>
               `workflow-helper-body-${iteration}`,
             source: (
@@ -1171,7 +1171,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.sharedHelper,
             kind: 'workflow',
-            expectedLogCounts: expectedBodyOnlyRebuild,
+            expectedLogCounts: expectedHotRebuild,
             expectedStepValue: (iteration: number) =>
               `shared-body-${iteration}`,
             expectedWorkflowValue: (iteration: number) =>
@@ -1186,7 +1186,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
           {
             file: files.serde,
             kind: 'serde',
-            expectedLogCounts: expectedBodyOnlyRebuild,
+            expectedLogCounts: expectedHotRebuild,
             source: (iteration: number) => `export class HmrFuzzBox {
   static classId = 'HmrFuzzBox';
 
