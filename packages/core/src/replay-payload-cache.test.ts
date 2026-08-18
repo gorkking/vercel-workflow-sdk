@@ -176,10 +176,10 @@ describe('ReplayPayloadCache', () => {
     expect(preparer).toHaveBeenCalledTimes(4);
   });
 
-  it('prepares streamed events synchronously inside the decoder callback', async () => {
+  it('starts streamed preparation inside the decoder callback', async () => {
     const payload = new Uint8Array([1]);
     const order: string[] = [];
-    const preparer = vi.fn<ReplayPayloadPreparer>((value) => {
+    const preparer = vi.fn<ReplayPayloadPreparer>(async (value) => {
       order.push('prepare');
       return value;
     });
@@ -193,9 +193,9 @@ describe('ReplayPayloadCache', () => {
     cache.prepareEvent(event);
     expect(order).toEqual(['prepare']);
 
-    expect(
+    await expect(
       cache.getEventValue(event.eventId, payload, (prepared) => prepared)
-    ).toEqual({ data: payload });
+    ).resolves.toEqual({ data: payload });
   });
 
   it('caches real decrypt/decompress output but revives fresh objects', async () => {
@@ -213,7 +213,9 @@ describe('ReplayPayloadCache', () => {
     const preparer = vi.fn<ReplayPayloadPreparer>(decodePayload);
     const cache = new ReplayPayloadCache(key, preparer);
 
-    await decodePayload(serialized, key);
+    const directPreparation = decodePayload(serialized, key);
+    expect(directPreparation).toBeInstanceOf(Promise);
+    await directPreparation;
 
     const prepared = await cache.getEventValue(
       'evnt_encrypted',
@@ -238,10 +240,25 @@ describe('ReplayPayloadCache', () => {
     expect(second.count).toBe(0);
   });
 
-  it('finds events inserted below a previously prepared prefix', () => {
-    // A stale-snapshot restart can replace the log with a corrected one whose
-    // missing events appear below the old tail. Full scans are cheap because
-    // event-id cache hits do no payload work.
+  it('prepares only events appended after the scanned prefix', () => {
+    const payloads = [0, 1, 2].map((value) => new Uint8Array([value]));
+    const preparer = vi.fn<ReplayPayloadPreparer>(async (value) => value);
+    const cache = new ReplayPayloadCache(undefined, preparer);
+    const run = makeRun(undefined);
+    const [first, second, third] = makeEvents(payloads);
+    const prepareEvent = vi.spyOn(cache, 'prepareEvent');
+
+    cache.prepareAll(run, [first, second]);
+    expect(preparer).toHaveBeenCalledTimes(2);
+
+    prepareEvent.mockClear();
+    cache.prepareAll(run, [first, second, third]);
+    expect(prepareEvent).toHaveBeenCalledOnce();
+    expect(prepareEvent).toHaveBeenCalledWith(third);
+    expect(preparer).toHaveBeenCalledTimes(3);
+  });
+
+  it('rescans a corrected event log after reset', () => {
     const payloads = [0, 1, 2].map((value) => new Uint8Array([value]));
     const preparer = vi.fn<ReplayPayloadPreparer>(async (value) => value);
     const cache = new ReplayPayloadCache(undefined, preparer);
@@ -249,8 +266,10 @@ describe('ReplayPayloadCache', () => {
     const [first, missing, second] = makeEvents(payloads);
 
     cache.prepareAll(run, [first, second]);
+    cache.prepareAll(run, [first, missing, second]);
     expect(preparer).toHaveBeenCalledTimes(2);
 
+    cache.resetScan();
     cache.prepareAll(run, [first, missing, second]);
     expect(preparer).toHaveBeenCalledTimes(3);
     expect(preparer).toHaveBeenLastCalledWith(payloads[1], undefined);
@@ -304,9 +323,14 @@ describe('ReplayPayloadCache', () => {
     expect(error).toHaveBeenCalledOnce();
   });
 
-  it('rehydrates mutable results and memoizes primitives of any size', async () => {
-    const oversized = 'x'.repeat(4097);
-    for (const value of [{ count: 0 }, oversized]) {
+  it('memoizes primitives within the budget and rehydrates larger results', async () => {
+    const commonText = 'x'.repeat(256 * 1024);
+    const oversizedText = 'x'.repeat(16 * 1024 * 1024 + 1);
+    for (const [value, expectedHydrations] of [
+      [{ count: 0 }, 2],
+      [commonText, 1],
+      [oversizedText, 2],
+    ] as const) {
       const cache = new ReplayPayloadCache();
       const hydrate = vi
         .fn()
@@ -324,11 +348,10 @@ describe('ReplayPayloadCache', () => {
         undefined,
         hydrate
       );
+      expect(hydrate).toHaveBeenCalledTimes(expectedHydrations);
       if (typeof value === 'object') {
-        expect(hydrate).toHaveBeenCalledTimes(2);
         expect(second).not.toBe(first);
-      } else {
-        expect(hydrate).toHaveBeenCalledOnce();
+      } else if (expectedHydrations === 1) {
         expect(second).toBe(first);
       }
     }
