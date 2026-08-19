@@ -208,7 +208,7 @@ export function createDevTests(config?: DevTestConfig) {
       if (!devServerLogPath || !shouldAssertDevHmrLogs) {
         return;
       }
-      let lastCounts = '';
+      let lastHmrLogIndex = -1;
       let quietSince = Date.now();
       await pollUntil({
         description: 'dev server HMR pipeline to go quiescent',
@@ -216,22 +216,18 @@ export function createDevTests(config?: DevTestConfig) {
         intervalMs: 250,
         check: async () => {
           const log = await readDevServerLog();
-          const hot = countLogMessage(log, hmrLogMessages.hot);
-          const full = countLogMessage(log, hmrLogMessages.full);
-          const skip = countLogMessage(log, hmrLogMessages.skip);
-          const idle = countLogMessage(log, hmrLogMessages.idle);
-          const counts = `${hot}/${full}/${skip}/${idle}`;
-          if (counts !== lastCounts) {
-            lastCounts = counts;
+          const lastDecisionIndex = Math.max(
+            log.lastIndexOf(hmrLogMessages.hot),
+            log.lastIndexOf(hmrLogMessages.full),
+            log.lastIndexOf(hmrLogMessages.skip)
+          );
+          const lastIdleIndex = log.lastIndexOf(hmrLogMessages.idle);
+          const latestHmrLogIndex = Math.max(lastDecisionIndex, lastIdleIndex);
+          if (latestHmrLogIndex !== lastHmrLogIndex) {
+            lastHmrLogIndex = latestHmrLogIndex;
             quietSince = Date.now();
           }
-          expect(log.lastIndexOf(hmrLogMessages.idle)).toBeGreaterThanOrEqual(
-            Math.max(
-              log.lastIndexOf(hmrLogMessages.hot),
-              log.lastIndexOf(hmrLogMessages.full),
-              log.lastIndexOf(hmrLogMessages.skip)
-            )
-          );
+          expect(lastIdleIndex).toBeGreaterThanOrEqual(lastDecisionIndex);
           expect(Date.now() - quietSince).toBeGreaterThanOrEqual(
             hmrQuiescenceQuietMs
           );
@@ -250,31 +246,30 @@ export function createDevTests(config?: DevTestConfig) {
     };
     const countLogMessage = (log: string, message: string) =>
       log.split(message).length - 1;
-    type ExpectedHmrLogCount = number | { min?: number; max?: number };
-    type ExpectedHmrLogCounts =
-      | 'any'
-      | {
-          skip?: ExpectedHmrLogCount;
-          hot?: ExpectedHmrLogCount;
-          full?: ExpectedHmrLogCount;
-        };
+    type ExpectedHmrLogCount =
+      | number
+      | { kind: 'range'; min: number; max: number };
+    type ExpectedHmrLogCounts = {
+      skip?: ExpectedHmrLogCount;
+      hot?: ExpectedHmrLogCount;
+      full?: ExpectedHmrLogCount;
+    };
     const expectLogCount = (
       actual: number,
       expected: ExpectedHmrLogCount | undefined
     ) => {
-      if (typeof expected === 'number') {
-        // Canary webpack can emit duplicate watcher events for one edit; keep
-        // stable exact while treating canary counts as lower bounds.
-        if (finalConfig.canary) {
-          expect(actual).toBeGreaterThanOrEqual(expected);
-          return;
-        }
-        expect(actual).toBe(expected);
+      if (expected === undefined || typeof expected === 'number') {
+        expect(actual).toBe(expected ?? 0);
         return;
       }
-      expect(actual).toBeGreaterThanOrEqual(expected?.min ?? 0);
-      if (expected?.max !== undefined) {
-        expect(actual).toBeLessThanOrEqual(expected.max);
+      switch (expected.kind) {
+        case 'range':
+          expect(actual).toBeGreaterThanOrEqual(expected.min);
+          expect(actual).toBeLessThanOrEqual(expected.max);
+          return;
+        default:
+          expected satisfies never;
+          throw new Error('Unknown HMR log count expectation');
       }
     };
     const expectHmrLogCounts = async (
@@ -284,40 +279,12 @@ export function createDevTests(config?: DevTestConfig) {
       if (cursor === undefined) {
         return;
       }
-      await pollUntil({
-        description: 'dev server HMR logs to match expected rebuild counts',
-        timeoutMs: hmrRediscoveryTimeoutMs,
-        intervalMs: 250,
-        check: async () => {
-          const log = (await readDevServerLog()).slice(cursor);
-          expect(log).toContain(hmrLogMessages.idle);
-          if (expected === 'any') {
-            expect(
-              [
-                hmrLogMessages.skip,
-                hmrLogMessages.hot,
-                hmrLogMessages.full,
-              ].reduce(
-                (count, message) => count + countLogMessage(log, message),
-                0
-              )
-            ).toBeGreaterThan(0);
-            return;
-          }
-          expectLogCount(
-            countLogMessage(log, hmrLogMessages.skip),
-            expected.skip
-          );
-          expectLogCount(
-            countLogMessage(log, hmrLogMessages.hot),
-            expected.hot
-          );
-          expectLogCount(
-            countLogMessage(log, hmrLogMessages.full),
-            expected.full
-          );
-        },
-      });
+      await waitForHmrQuiescence();
+      const log = (await readDevServerLog()).slice(cursor);
+      expect(log).toContain(hmrLogMessages.idle);
+      expectLogCount(countLogMessage(log, hmrLogMessages.skip), expected.skip);
+      expectLogCount(countLogMessage(log, hmrLogMessages.hot), expected.hot);
+      expectLogCount(countLogMessage(log, hmrLogMessages.full), expected.full);
     };
 
     const pollUntil = async ({
@@ -482,7 +449,10 @@ export async function hmrPageWorkflow() {
             );
           },
         });
-        await expectHmrLogCounts(logCursor, { full: 1, skip: { max: 1 } });
+        await expectHmrLogCounts(logCursor, {
+          full: 1,
+          skip: { kind: 'range', min: 0, max: 1 },
+        });
       }
     );
 
@@ -977,7 +947,6 @@ ${apiFileContent}`
         }
 
         await waitForHmrReady();
-        const setupLogCursor = await readDevServerLogCursor();
 
         const writeFuzzSources = async (iteration: number) => {
           await Promise.all([
@@ -1094,15 +1063,7 @@ ${apiFileContent}`
           },
         });
         assert(workflow);
-        await pollUntil({
-          description: 'HMR fuzz fixture rebuilds to finish',
-          timeoutMs: flowRouteHmrRediscoveryTimeoutMs,
-          intervalMs: 250,
-          check: async () => {
-            const log = (await readDevServerLog()).slice(setupLogCursor);
-            expect(log).toContain(hmrLogMessages.idle);
-          },
-        });
+        await waitForHmrQuiescence();
         const runWorkflow = async () => {
           const run = await start<
             [],
@@ -1155,7 +1116,7 @@ export async function hmrFuzzStep() {
           },
           {
             file: files.stepHelper,
-            kind: 'none',
+            kind: 'skip',
             expectedLogCounts: { skip: 1 },
             expectedStepValue: (iteration: number) =>
               `step-helper-only-${iteration}`,
@@ -1270,7 +1231,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
             });
           }
 
-          if (testCase.kind === 'none') {
+          if (testCase.kind === 'skip') {
             await expectHmrLogCounts(logCursor, testCase.expectedLogCounts);
             snapshot = await waitForGeneratedArtifactStability();
             continue;
@@ -1290,6 +1251,7 @@ export function hmrFuzzWorkflowHelper(value: HmrFuzzBox) {
         const fullCases = [
           {
             description: 'workflow import graph change',
+            expectedLogCounts: { full: 1 },
             write: async () => {
               await fs.writeFile(
                 files.workflow,
@@ -1323,6 +1285,7 @@ export async function hmrFuzzWorkflow() {
           },
           {
             description: 'step definition added',
+            expectedLogCounts: { full: 1 },
             write: async (iteration: number) => {
               await fs.writeFile(
                 files.step,
@@ -1357,6 +1320,7 @@ export async function hmrFuzzAddedStep() {
           },
           {
             description: 'workflow definition added',
+            expectedLogCounts: { full: 1 },
             write: async (iteration: number) => {
               await fs.writeFile(
                 files.workflow,
@@ -1399,7 +1363,7 @@ export async function hmrFuzzAddedWorkflow() {
           {
             description: 'workflow file added through API import',
             expectedLogCounts: {
-              full: { min: 1, max: 2 },
+              full: { kind: 'range', min: 1, max: 2 },
             },
             write: async (iteration: number) => {
               await fs.writeFile(
@@ -1435,7 +1399,7 @@ ${apiFileContent}`
           {
             description: 'workflow file removed from API import',
             expectedLogCounts: {
-              full: { min: 1, max: 2 },
+              full: { kind: 'range', min: 1, max: 2 },
             },
             write: async () => {
               await fs.rm(files.addedWorkflow, { force: true });
@@ -1467,12 +1431,7 @@ ${apiFileContent}`
           const logCursor = await readDevServerLogCursor();
           await fullCase.write(index + 1);
           await fullCase.assert(index + 1);
-          await expectHmrLogCounts(
-            logCursor,
-            'expectedLogCounts' in fullCase
-              ? fullCase.expectedLogCounts
-              : { full: 1 }
-          );
+          await expectHmrLogCounts(logCursor, fullCase.expectedLogCounts);
           snapshot = await waitForGeneratedArtifactStability();
         }
 
