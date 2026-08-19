@@ -248,6 +248,7 @@ export function createDevTests(config?: DevTestConfig) {
       log.split(message).length - 1;
     type ExpectedHmrLogCount =
       | number
+      | { kind: 'at-least'; value: number }
       | { kind: 'range'; min: number; max: number };
     type ExpectedHmrLogCounts = {
       skip?: ExpectedHmrLogCount;
@@ -263,6 +264,9 @@ export function createDevTests(config?: DevTestConfig) {
         return;
       }
       switch (expected.kind) {
+        case 'at-least':
+          expect(actual).toBeGreaterThanOrEqual(expected.value);
+          return;
         case 'range':
           expect(actual).toBeGreaterThanOrEqual(expected.min);
           expect(actual).toBeLessThanOrEqual(expected.max);
@@ -1097,8 +1101,11 @@ ${apiFileContent}`
         };
 
         let snapshot = await waitForGeneratedArtifactStability();
-        const expectedHotRebuild = finalConfig.canary
-          ? ('any' as const)
+        const expectedHotRebuild: ExpectedHmrLogCounts = finalConfig.canary
+          ? {
+              hot: { kind: 'at-least', value: 1 },
+              full: { kind: 'range', min: 0, max: 1 },
+            }
           : { hot: 1 };
         const cases = [
           {

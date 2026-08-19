@@ -871,6 +871,7 @@ jobs:
           pnpm install --no-frozen-lockfile
 
       - name: Install Dependencies
+        if: ${{ !matrix.app.canary }}
         run: pnpm install --frozen-lockfile
 
       - name: Download shared package builds
@@ -961,6 +962,7 @@ jobs:
           pnpm install --no-frozen-lockfile
 
       - name: Install Dependencies
+        if: ${{ !matrix.app.canary }}
         run: pnpm install --frozen-lockfile
 
       - name: Download shared package builds
@@ -1070,6 +1072,7 @@ jobs:
           pnpm install --no-frozen-lockfile
 
       - name: Install Dependencies
+        if: ${{ !matrix.app.canary }}
         run: pnpm install --frozen-lockfile
 
       - name: Download shared package builds
