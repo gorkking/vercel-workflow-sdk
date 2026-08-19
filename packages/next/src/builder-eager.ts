@@ -1,11 +1,10 @@
 import assert from 'node:assert';
 import { once } from 'node:events';
-import { constants, type Dirent } from 'node:fs';
+import { constants } from 'node:fs';
 import {
   access,
   copyFile,
   mkdir,
-  readdir,
   realpath,
   rm,
   stat,
@@ -89,22 +88,6 @@ export async function getNextBuilderEager(
       ]);
       const isWatchableFile = (path: string) =>
         watchableExtensions.has(extname(path));
-      const normalizedGeneratedDir = workflowGeneratedDir.replace(/\\/g, '/');
-      const normalizedDistDir = normalizePath(this.config.distDir);
-      const isIgnoredWatchPath = createWatchIgnorePredicate({
-        workingDir: this.config.workingDir,
-        projectRoot: this.transformProjectRoot,
-        extraFragments: [normalizedGeneratedDir],
-      });
-      const hasIgnoredPathFragment = (normalizedPath: string) => {
-        if (
-          normalizedPath === normalizedDistDir ||
-          normalizedPath.startsWith(`${normalizedDistDir}/`)
-        ) {
-          return true;
-        }
-        return isIgnoredWatchPath(normalizedPath);
-      };
       const logDevHmr = (...args: unknown[]) => {
         if (process.env.WORKFLOW_DEV_HMR_LOGS === '1') {
           console.log(...args);
@@ -112,27 +95,40 @@ export async function getNextBuilderEager(
       };
 
       let initialBuildChanged = false;
-      const markInitialBuildChanged = (pathname: string) => {
+      const markInitialBuildChanged = (_event: string, pathname: string) => {
         if (isWatchableFile(normalizePath(pathname))) {
           initialBuildChanged = true;
         }
       };
-      // Chokidar 4 registers an fs.watch per directory, so prune ignored trees
-      // before it walks the project.
-      const watcher = this.config.watch
-        ? chokidar.watch(this.config.workingDir, {
-            ignoreInitial: true,
-            followSymlinks: true,
-            ignored: (pathname) => {
-              const normalizedPath = normalizePath(String(pathname));
-              const extension = extname(normalizedPath);
-              if (extension && !watchableExtensions.has(extension)) {
-                return true;
-              }
-              return hasIgnoredPathFragment(normalizedPath);
-            },
-          })
-        : undefined;
+      const createWatcher = () => {
+        const generatedDir = workflowGeneratedDir.replace(/\\/g, '/');
+        const distDir = normalizePath(this.config.distDir);
+        const isIgnored = createWatchIgnorePredicate({
+          workingDir: this.config.workingDir,
+          projectRoot: this.transformProjectRoot,
+          extraFragments: [generatedDir],
+        });
+
+        // Chokidar 4 registers an fs.watch per directory, so prune ignored
+        // trees before it walks the project.
+        return chokidar.watch(this.config.workingDir, {
+          ignoreInitial: true,
+          followSymlinks: true,
+          ignored: (pathname) => {
+            const normalizedPath = normalizePath(String(pathname));
+            const extension = extname(normalizedPath);
+            if (extension && !watchableExtensions.has(extension)) {
+              return true;
+            }
+            return (
+              normalizedPath === distDir ||
+              normalizedPath.startsWith(`${distDir}/`) ||
+              isIgnored(normalizedPath)
+            );
+          },
+        });
+      };
+      const watcher = this.config.watch ? createWatcher() : undefined;
       const closeWatcherOnError = async <T>(promise: Promise<T>) => {
         try {
           return await promise;
@@ -142,17 +138,16 @@ export async function getNextBuilderEager(
         }
       };
       if (watcher) {
-        watcher.on('add', markInitialBuildChanged);
-        watcher.on('change', markInitialBuildChanged);
-        watcher.on('unlink', markInitialBuildChanged);
+        watcher.on('all', markInitialBuildChanged);
         watcher.on('error', (error) => {
           console.error('Workflow dev watcher error', error);
         });
         await closeWatcherOnError(once(watcher, 'ready'));
       }
 
-      const inputFiles = await closeWatcherOnError(this.getInputFiles());
-      const tsconfigPath = await closeWatcherOnError(this.findTsConfigPath());
+      const [inputFiles, tsconfigPath] = await closeWatcherOnError(
+        Promise.all([this.getInputFiles(), this.findTsConfigPath()])
+      );
 
       const options = {
         inputFiles,
@@ -344,48 +339,18 @@ export async function getNextBuilderEager(
             return canonicalPath;
           };
 
-          const visit = async (directory: string): Promise<void> => {
-            let dirents: Dirent<string>[];
-            try {
-              dirents = await readdir(directory, { withFileTypes: true });
-            } catch {
-              return;
-            }
-
-            await Promise.all(
-              dirents.map(async (dirent) => {
-                const filePath = normalizePath(join(directory, dirent.name));
-                if (hasIgnoredPathFragment(filePath)) {
-                  return;
-                }
-
-                if (dirent.isDirectory()) {
-                  await visit(filePath);
-                  return;
-                }
-
-                let stats: Awaited<ReturnType<typeof stat>>;
-                try {
-                  stats = await stat(filePath);
-                } catch {
-                  return;
-                }
-
-                if (stats.isDirectory()) {
-                  await visit(filePath);
-                  return;
-                }
-
-                if (!stats.isFile() || !isWatchableFile(filePath)) {
-                  return;
-                }
-
-                await addKnownFile(filePath);
-              })
-            );
-          };
-
-          await visit(this.config.workingDir);
+          const watched = watcher.getWatched();
+          const directories = new Set(Object.keys(watched).map(normalizePath));
+          await Promise.all(
+            Object.entries(watched).flatMap(([directory, names]) =>
+              names
+                .map((name) => normalizePath(join(directory, name)))
+                .filter(
+                  (file) => !directories.has(file) && isWatchableFile(file)
+                )
+                .map(addKnownFile)
+            )
+          );
           return { aliases, addKnownFile };
         };
 
@@ -484,9 +449,7 @@ export async function getNextBuilderEager(
           scheduleFileChange(canonicalPath);
         };
 
-        watcher.off('add', markInitialBuildChanged);
-        watcher.off('change', markInitialBuildChanged);
-        watcher.off('unlink', markInitialBuildChanged);
+        watcher.off('all', markInitialBuildChanged);
 
         watcher.on('add', handleFileWritten);
         watcher.on('change', handleFileWritten);
