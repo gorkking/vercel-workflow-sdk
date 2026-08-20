@@ -1021,6 +1021,14 @@ export interface CreateEventParams {
    * `resumeHook()` must not set it.
    */
   preloadEvents?: true;
+  /**
+   * Observe replay-preload events immediately after validation, in stream
+   * order. The callback is synchronous: it delays the next frame and therefore
+   * applies response backpressure. Recovery continues after the last observed
+   * event instead of replaying the accepted prefix. Throwing aborts the
+   * operation and is never treated as a transport failure or retried.
+   */
+  onEvent?: (event: Event) => void;
 }
 
 /**
@@ -1208,6 +1216,14 @@ export interface ListEventsParams {
   /** Omit `limit` to return every remaining event. */
   pagination?: PaginationOptions;
   resolveData?: ResolveData;
+  /**
+   * Observe events immediately after validation, in stream order. The callback
+   * is synchronous: it delays the next frame and therefore applies response
+   * backpressure. Recovery continues after the last observed event instead of
+   * replaying the accepted prefix. Throwing aborts the operation and is never
+   * treated as a transport failure or retried.
+   */
+  onEvent?: (event: Event) => void;
 }
 
 export interface ListEventsByCorrelationIdParams {

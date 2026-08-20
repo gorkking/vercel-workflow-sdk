@@ -374,6 +374,51 @@ describe('getWorkflowRunEventsV4 over HTTP', () => {
     agent.assertNoPendingInterceptors();
   });
 
+  it('does not retry an observer failure that resembles transport failure', async () => {
+    const agent = mockAgent();
+    agent
+      .get(ORIGIN)
+      .intercept({
+        path: '/api/v4/runs/wrun_1/events?remoteRefBehavior=resolve&returnAll=true',
+        method: 'GET',
+      })
+      .reply(
+        200,
+        Buffer.concat([
+          encodeFrame(
+            {
+              eventId: 'evnt_1',
+              runId: 'wrun_1',
+              eventType: 'run_started',
+              createdAt: CREATED_AT,
+            },
+            new Uint8Array()
+          ),
+          encodeFrame(
+            { _end: 1, next: 'eid:evnt_1', hasMore: false },
+            new Uint8Array()
+          ),
+        ]),
+        { headers: { 'content-type': V4_FRAME_CONTENT_TYPE } }
+      );
+
+    const observerError = new WorkflowWorldError('observer failed', {
+      code: 'TRANSPORT',
+    });
+    await expect(
+      getWorkflowRunEventsV4(
+        {
+          runId: 'wrun_1',
+          onEvent: () => {
+            throw observerError;
+          },
+        },
+        { token: 'test-token', dispatcher: agent }
+      )
+    ).rejects.toBe(observerError);
+    agent.assertNoPendingInterceptors();
+  });
+
   it('captures an explicit hasMore from the sentinel, independent of next', async () => {
     const agent = mockAgent();
 
@@ -1022,6 +1067,7 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
 
   it('continues a truncated run_started stream after its last event', async () => {
     const agent = mockAgent();
+    const observed: string[] = [];
 
     agent
       .get(ORIGIN)
@@ -1081,7 +1127,8 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
 
     const result = await createWorkflowRunStartedEventV4(
       { runId: 'wrun_1', specVersion: 5 },
-      { token: 'test-token', dispatcher: agent }
+      { token: 'test-token', dispatcher: agent },
+      (event) => observed.push(event.eventId)
     );
 
     expect(result.events.map((event) => event.eventId)).toEqual([
@@ -1089,6 +1136,7 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
       'evnt_2',
     ]);
     expect(result.hasMore).toBe(false);
+    expect(observed).toEqual(['evnt_1', 'evnt_2']);
     agent.assertNoPendingInterceptors();
   });
 
@@ -1162,6 +1210,7 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
 
   it('retries a truncated continuation that produced no complete event', async () => {
     const agent = mockAgent();
+    const observed: string[] = [];
     const continuationPath =
       '/api/v4/runs/wrun_1/events?cursor=eid%3Aevnt_1&remoteRefBehavior=resolve&returnAll=true';
 
@@ -1228,13 +1277,15 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
 
     const result = await createWorkflowRunStartedEventV4(
       { runId: 'wrun_1', specVersion: 5 },
-      { token: 'test-token', dispatcher: agent }
+      { token: 'test-token', dispatcher: agent },
+      (event) => observed.push(event.eventId)
     );
 
     expect(result.events.map((event) => event.eventId)).toEqual([
       'evnt_1',
       'evnt_2',
     ]);
+    expect(observed).toEqual(['evnt_1', 'evnt_2']);
     expect(result.cursor).toBe('eid:evnt_2');
     agent.assertNoPendingInterceptors();
   });

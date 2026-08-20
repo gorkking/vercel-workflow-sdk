@@ -42,6 +42,7 @@ import {
 import { decode } from 'cbor-x';
 import { z } from 'zod';
 import {
+  EventObserverError,
   EventPostResponseError,
   isRetryableEventRequestError,
 } from './event-retry.js';
@@ -179,9 +180,10 @@ async function withV4ResponseBody<T>(
   } catch (error) {
     if (!outcomeReported) {
       const incomplete =
-        error instanceof IncompleteFrameError ||
-        error instanceof PartialEventStreamError ||
-        isRecyclableTransportError(error);
+        !(error instanceof EventObserverError) &&
+        (error instanceof IncompleteFrameError ||
+          error instanceof PartialEventStreamError ||
+          isRecyclableTransportError(error));
       report(incomplete ? error : undefined);
     }
     throw error;
@@ -856,11 +858,13 @@ async function decodeCreateEventResponse<T extends EventType>(
 
 export async function createWorkflowRunStartedEventV4(
   input: CreateEventV4InputBase,
-  config?: APIConfig
+  config?: APIConfig,
+  onEvent?: (event: Event) => void
 ) {
   const { responseHeaders, ...replay } = await postReplayLogEvent(
     { ...input, eventType: 'run_started' },
-    config
+    config,
+    onEvent
   );
   assert(replay.cursor, 'v4 createEvent: event stream missing cursor');
   const maxEvents = MaxEventsHeaderSchema.safeParse(
@@ -1283,7 +1287,8 @@ interface ReplayLog {
  */
 export async function createHookReceivedPreloadEventV4(
   input: CreateEventV4InputBase,
-  config?: APIConfig
+  config?: APIConfig,
+  onEvent?: (event: Event) => void
 ): Promise<
   ReplayLog & {
     canonicalEventId: string | undefined;
@@ -1292,7 +1297,8 @@ export async function createHookReceivedPreloadEventV4(
 > {
   const { responseHeaders, ...replay } = await postReplayLogEvent(
     { ...input, eventType: 'hook_received' },
-    config
+    config,
+    onEvent
   );
   const maxEvents = MaxEventsHeaderSchema.safeParse(
     responseHeaders.get(MAX_EVENTS_HEADER)
@@ -1385,7 +1391,8 @@ const MAX_PARTIAL_EVENT_STREAM_RETRIES = 3;
 async function consumeEventFrameStream(
   response: Response,
   opName: string,
-  events: Event[]
+  events: Event[],
+  onEvent?: (event: Event) => void
 ): Promise<{ cursor: string | null; hasMore: boolean }> {
   try {
     for await (const frame of decodeFrames(
@@ -1401,7 +1408,15 @@ async function consumeEventFrameStream(
       if (Object.keys(frame.meta).some((key) => key.startsWith('_'))) {
         throw new Error(`v4 ${opName}: unexpected control frame`);
       }
-      events.push(decodeEventFrame(frame));
+      const event = decodeEventFrame(frame);
+      events.push(event);
+      if (onEvent) {
+        try {
+          onEvent(event);
+        } catch (error) {
+          throw new EventObserverError(error);
+        }
+      }
     }
   } catch (cause) {
     if (!(cause instanceof IncompleteFrameError)) throw cause;
@@ -1422,7 +1437,8 @@ async function postReplayLogEvent(
   input: CreateEventV4InputBase & {
     eventType: 'run_started' | 'hook_received';
   },
-  config?: APIConfig
+  config?: APIConfig,
+  onEvent?: (event: Event) => void
 ): Promise<ReplayLog & { responseHeaders: Headers }> {
   const events: Event[] = [];
   let responseHeaders: Headers | undefined;
@@ -1432,7 +1448,12 @@ async function postReplayLogEvent(
       config,
       (response) => {
         responseHeaders = response.headers;
-        return consumeEventFrameStream(response, 'createEvent', events);
+        return consumeEventFrameStream(
+          response,
+          'createEvent',
+          events,
+          onEvent
+        );
       }
     );
     assert(responseHeaders);
@@ -1446,7 +1467,11 @@ async function postReplayLogEvent(
 
     try {
       const suffix = await getWorkflowRunEventsV4(
-        { runId: input.runId, pagination: { cursor: continuationCursor } },
+        {
+          runId: input.runId,
+          pagination: { cursor: continuationCursor },
+          onEvent,
+        },
         config
       );
       events.push(...suffix.data);
@@ -1527,10 +1552,17 @@ export async function getWorkflowRunEventsV4(
           opName: 'listEvents',
           streamResponse: true,
         },
-        (response) => consumeEventFrameStream(response, 'listEvents', events)
+        (response) =>
+          consumeEventFrameStream(
+            response,
+            'listEvents',
+            events,
+            params.onEvent
+          )
       );
       return { data: events, cursor: result.cursor, hasMore: result.hasMore };
     } catch (error) {
+      if (error instanceof EventObserverError) throw error.error;
       const lastEvent = events.at(-1);
       if (
         retries === MAX_PARTIAL_EVENT_STREAM_RETRIES ||

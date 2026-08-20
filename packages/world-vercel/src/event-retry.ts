@@ -88,6 +88,14 @@ export class EventPostResponseError extends Error {
   }
 }
 
+/** Preserve an observer's original thrown value without letting it retry I/O. */
+export class EventObserverError extends EventPostResponseError {
+  constructor(readonly error: unknown) {
+    super('event observer failed', { cause: error });
+    this.name = 'EventObserverError';
+  }
+}
+
 export interface EventRetryPolicy {
   /** Whether a failed POST of this event type may be retried in-process. */
   retryable: boolean;
