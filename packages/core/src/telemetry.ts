@@ -199,6 +199,23 @@ const StepExecutionDurationHistogram = once(async () => {
  * logs show the two packages' views side by side.
  */
 let otelDiagLogged = false;
+
+function describeThrownValue(value: unknown): string {
+  try {
+    if (
+      typeof value === 'object' &&
+      value !== null &&
+      'message' in value &&
+      typeof value.message === 'string'
+    ) {
+      return value.message;
+    }
+    return String(value);
+  } catch {
+    return 'Unknown error';
+  }
+}
+
 function logOtelDiagnosticOnce(otel: typeof api, tracer: api.Tracer): void {
   const debugEnabled =
     typeof process !== 'undefined' &&
@@ -263,7 +280,7 @@ export async function trace<T>(
       } else {
         span.setStatus({
           code: otel.SpanStatusCode.ERROR,
-          message: (e as Error).message,
+          message: describeThrownValue(e),
         });
       }
       throw e;
@@ -292,7 +309,7 @@ export async function startTraceSpan(spanName: string) {
     fail: (error: unknown) =>
       finish({
         code: otel.SpanStatusCode.ERROR,
-        message: (error as Error).message,
+        message: describeThrownValue(error),
       }),
   };
 }
