@@ -1,13 +1,5 @@
 import { constants } from 'node:fs';
-import {
-  access,
-  copyFile,
-  mkdir,
-  readFile,
-  rm,
-  stat,
-  writeFile,
-} from 'node:fs/promises';
+import { access, mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,6 +9,7 @@ import {
   NORMALIZE_REQUEST_CODE,
   resolveProjectRoot,
   type SvelteKitConfig,
+  writeFileIfChanged,
 } from '@workflow/builders';
 
 const SVELTEKIT_VIRTUAL_MODULES = [
@@ -70,7 +63,7 @@ export class SvelteKitBuilder extends BaseBuilder {
 
     // Add .gitignore to exclude generated files from version control
     if (process.env.VERCEL_DEPLOYMENT_ID === undefined) {
-      await writeFile(join(workflowGeneratedDir, '.gitignore'), '*');
+      await writeFileIfChanged(join(workflowGeneratedDir, '.gitignore'), '*');
     }
 
     // Clean up stale V1 step route directory (may persist via Vercel build cache)
@@ -110,7 +103,10 @@ export const POST = async ({request}) => {
   return workflowEntrypoint(workflowCode${options})(normalRequest);
 }`
     );
-    await writeFile(workflowsRouteFile, workflowsRouteContent);
+    // These files are generated into the SvelteKit routes directory, which
+    // Vite watches in dev, so an identical rewrite would still invalidate the
+    // module and force a redundant recompile.
+    await writeFileIfChanged(workflowsRouteFile, workflowsRouteContent);
 
     await this.buildWebhookRoute({ workflowGeneratedDir });
 
@@ -131,11 +127,13 @@ export const POST = async ({request}) => {
       );
       await mkdir(staticManifestDir, { recursive: true });
       if (process.env.VERCEL_DEPLOYMENT_ID === undefined) {
-        await writeFile(join(staticManifestDir, '.gitignore'), '*');
+        await writeFileIfChanged(join(staticManifestDir, '.gitignore'), '*');
       }
-      await copyFile(
-        join(workflowGeneratedDir, 'manifest.json'),
-        join(staticManifestDir, 'manifest.json')
+      // Written from the same string rather than copied, so an unchanged
+      // manifest leaves the static copy untouched too.
+      await writeFileIfChanged(
+        join(staticManifestDir, 'manifest.json'),
+        manifestJson
       );
     }
   }
@@ -193,7 +191,7 @@ export const HEAD = createSvelteKitHandler('HEAD');
 export const OPTIONS = createSvelteKitHandler('OPTIONS');`
     );
 
-    await writeFile(webhookRouteFile, webhookRouteContent);
+    await writeFileIfChanged(webhookRouteFile, webhookRouteContent);
   }
 
   private async loadRoutesDirectory(): Promise<string> {
