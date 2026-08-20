@@ -323,13 +323,13 @@ describe('ReplayPayloadCache', () => {
     expect(error).toHaveBeenCalledOnce();
   });
 
-  it('memoizes primitives within the budget and rehydrates larger results', async () => {
+  it('memoizes primitives of any size and rehydrates object results', async () => {
     const commonText = 'x'.repeat(256 * 1024);
     const oversizedText = 'x'.repeat(16 * 1024 * 1024 + 1);
     for (const [value, expectedHydrations] of [
       [{ count: 0 }, 2],
       [commonText, 1],
-      [oversizedText, 2],
+      [oversizedText, 1],
     ] as const) {
       const cache = new ReplayPayloadCache();
       const hydrate = vi

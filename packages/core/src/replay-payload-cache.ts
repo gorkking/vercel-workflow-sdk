@@ -23,7 +23,6 @@ async function prepareReplayPayload(
 }
 
 const WORKFLOW_INPUT = Symbol('workflow-input');
-const MAX_MEMOIZED_PRIMITIVE_CHARACTERS = 16 * 1024 * 1024;
 type ReplayPayloadKey = string | typeof WORKFLOW_INPUT;
 
 /** Copy a view only when retaining it would also retain unrelated bytes. */
@@ -33,19 +32,12 @@ function compactOwnedBytes(data: Uint8Array): Uint8Array {
     : data.slice();
 }
 
-function cacheablePrimitiveCharacters(value: unknown): number | undefined {
+function isCacheablePrimitive(value: unknown): boolean {
   const type = typeof value;
-  if (value === null) return 0;
-  if (type === 'string') {
-    return (value as string).length;
-  }
-  if (type === 'bigint') {
-    return (value as bigint).toString().length;
-  }
-  if (type === 'object' || type === 'function' || type === 'symbol') {
-    return undefined;
-  }
-  return 0;
+  return (
+    value === null ||
+    (type !== 'object' && type !== 'function' && type !== 'symbol')
+  );
 }
 
 /**
@@ -54,8 +46,7 @@ function cacheablePrimitiveCharacters(value: unknown): number | undefined {
  * The cache retains VM-independent decrypt/decompress output across fresh VMs.
  * Deserialization still runs against each VM's globals so object graphs and
  * Workflow objects remain realm-local. Primitive final values are safe to
- * share and skip that repeated deserialization entirely, within a bounded
- * character budget because their prepared bytes remain cached too.
+ * share and skip that repeated deserialization entirely.
  *
  * Key lookup is deliberately outside this class. The runtime creates the
  * cache once the run's key has resolved, then feeds it decoded events.
@@ -66,7 +57,6 @@ export class ReplayPayloadCache {
     Promise<Uint8Array>
   >();
   private readonly primitiveValues = new Map<string, unknown>();
-  private memoizedPrimitiveCharacters = 0;
   private nextUnpreparedEventIndex = 0;
 
   constructor(
@@ -140,16 +130,8 @@ export class ReplayPayloadCache {
   }
 
   private cachePrimitive(eventId: string, value: unknown): unknown {
-    const characters = cacheablePrimitiveCharacters(value);
-    if (
-      characters === undefined ||
-      this.memoizedPrimitiveCharacters + characters >
-        MAX_MEMOIZED_PRIMITIVE_CHARACTERS
-    ) {
-      return value;
-    }
+    if (!isCacheablePrimitive(value)) return value;
     this.primitiveValues.set(eventId, value);
-    this.memoizedPrimitiveCharacters += characters;
     return value;
   }
 
