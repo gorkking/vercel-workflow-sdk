@@ -1466,7 +1466,7 @@ async function postReplayLogEvent(
     const continuationCursor = `eid:${lastEvent.eventId}`;
 
     try {
-      const suffix = await getWorkflowRunEventsV4(
+      const suffix = await listWorkflowRunEventsV4(
         {
           runId: input.runId,
           pagination: { cursor: continuationCursor },
@@ -1482,6 +1482,7 @@ async function postReplayLogEvent(
         responseHeaders,
       };
     } catch (cause) {
+      if (cause instanceof EventObserverError) throw cause;
       throw new EventPostResponseError(
         `v4 createEvent: replay continuation failed for run ${input.runId}`,
         { cause }
@@ -1531,7 +1532,7 @@ function paginationToQuery(
  * `getWorkflowRunEvents` contract. A truncated full response resumes
  * after its last validated event instead of downloading accepted frames again.
  */
-export async function getWorkflowRunEventsV4(
+async function listWorkflowRunEventsV4(
   params: ListEventsParams,
   config?: APIConfig
 ): Promise<PaginatedResponse<Event>> {
@@ -1562,7 +1563,7 @@ export async function getWorkflowRunEventsV4(
       );
       return { data: events, cursor: result.cursor, hasMore: result.hasMore };
     } catch (error) {
-      if (error instanceof EventObserverError) throw error.error;
+      if (error instanceof EventObserverError) throw error;
       const lastEvent = events.at(-1);
       if (
         retries === MAX_PARTIAL_EVENT_STREAM_RETRIES ||
@@ -1573,6 +1574,18 @@ export async function getWorkflowRunEventsV4(
       }
       if (lastEvent) cursor = `eid:${lastEvent.eventId}`;
     }
+  }
+}
+
+export async function getWorkflowRunEventsV4(
+  params: ListEventsParams,
+  config?: APIConfig
+): Promise<PaginatedResponse<Event>> {
+  try {
+    return await listWorkflowRunEventsV4(params, config);
+  } catch (error) {
+    if (error instanceof EventObserverError) throw error.error;
+    throw error;
   }
 }
 

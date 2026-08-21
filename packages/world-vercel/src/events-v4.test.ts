@@ -1208,11 +1208,13 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
     agent.assertNoPendingInterceptors();
   });
 
-  it('retries a truncated continuation that produced no complete event', async () => {
+  it('resumes after an event observed during a truncated continuation', async () => {
     const agent = mockAgent();
     const observed: string[] = [];
     const continuationPath =
       '/api/v4/runs/wrun_1/events?cursor=eid%3Aevnt_1&remoteRefBehavior=resolve&returnAll=true';
+    const resumedPath =
+      '/api/v4/runs/wrun_1/events?cursor=eid%3Aevnt_2&remoteRefBehavior=resolve&returnAll=true';
 
     agent
       .get(ORIGIN)
@@ -1257,21 +1259,18 @@ describe('createWorkflowRunEventV4 over HTTP', () => {
     agent
       .get(ORIGIN)
       .intercept({ path: continuationPath, method: 'GET' })
-      .reply(200, runStartedFrame.subarray(0, 4), {
+      .reply(200, runStartedFrame, {
         headers: { 'content-type': V4_FRAME_CONTENT_TYPE },
       });
     agent
       .get(ORIGIN)
-      .intercept({ path: continuationPath, method: 'GET' })
+      .intercept({ path: resumedPath, method: 'GET' })
       .reply(
         200,
-        Buffer.concat([
-          runStartedFrame,
-          encodeFrame(
-            { _end: 1, next: 'eid:evnt_2', hasMore: false },
-            new Uint8Array()
-          ),
-        ]),
+        encodeFrame(
+          { _end: 1, next: 'eid:evnt_2', hasMore: false },
+          new Uint8Array()
+        ),
         { headers: { 'content-type': V4_FRAME_CONTENT_TYPE } }
       );
 

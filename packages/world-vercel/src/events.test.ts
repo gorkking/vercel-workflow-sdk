@@ -414,6 +414,80 @@ describe('createWorkflowRunEvent result contract', () => {
     agent.assertNoPendingInterceptors();
   });
 
+  it('preserves an observer failure from a replay continuation', async () => {
+    const agent = mockAgent();
+    agent
+      .get(ORIGIN)
+      .intercept({
+        path: '/api/v4/runs/wrun_1/events/run_started',
+        method: 'POST',
+      })
+      .reply(
+        200,
+        encodeFrame(
+          {
+            eventId: 'evnt_0',
+            runId: 'wrun_1',
+            eventType: 'run_created',
+            createdAt: new Date('2026-06-09T23:59:59.000Z'),
+            specVersion: 2,
+            eventData: {
+              deploymentId: 'dpl_1',
+              workflowName: 'workflow',
+            },
+          },
+          new Uint8Array()
+        ),
+        {
+          headers: {
+            'content-type': V4_FRAME_CONTENT_TYPE,
+            'x-wf-max-events': '10000',
+          },
+        }
+      );
+    agent
+      .get(ORIGIN)
+      .intercept({
+        path: '/api/v4/runs/wrun_1/events?cursor=eid%3Aevnt_0&remoteRefBehavior=resolve&returnAll=true',
+        method: 'GET',
+      })
+      .reply(
+        200,
+        encodeFrame(
+          {
+            eventId: 'evnt_1',
+            runId: 'wrun_1',
+            eventType: 'run_started',
+            createdAt: STARTED_AT,
+            specVersion: 2,
+            eventData: {},
+          },
+          new Uint8Array()
+        ),
+        { headers: { 'content-type': V4_FRAME_CONTENT_TYPE } }
+      );
+
+    const observerError = new WorkflowWorldError('observer failed', {
+      code: 'TRANSPORT',
+    });
+    const observed: string[] = [];
+    const onEvent = vi.fn((event: { eventId: string }) => {
+      observed.push(event.eventId);
+      if (event.eventId === 'evnt_1') throw observerError;
+    });
+
+    await expect(
+      createWorkflowRunEvent(
+        'wrun_1',
+        { eventType: 'run_started', specVersion: 2 } as AnyEventRequest,
+        { onEvent },
+        { token: 'test-token', dispatcher: agent }
+      )
+    ).rejects.toBe(observerError);
+    expect(observed).toEqual(['evnt_0', 'evnt_1']);
+    agent.assertNoPendingInterceptors();
+  });
+
   it('does not repeat a run_started POST when its continuation exhausts retries', async () => {
     const agent = mockAgent();
     agent
