@@ -117,10 +117,10 @@ describe('compression telemetry attributes', () => {
     );
 
     recordedAttributes.length = 0;
-    await new ReplayPayloadCache(undefined).prepareEventPayload(
+    await new ReplayPayloadCache(undefined).getEventValue(
       'evnt_test',
-      'result',
-      data
+      data,
+      (prepared) => prepared
     );
 
     const attrs = lastAttrs();
