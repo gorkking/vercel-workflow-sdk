@@ -2198,13 +2198,12 @@ export function workflowEntrypoint(
                           ),
                         });
                       } else {
-                        // Successful write, no usable preload (CBOR response
-                        // from an older server, a World that ignored the
-                        // opt-in, a bounded hasMore page, or a preload that
-                        // failed validation): take the generic run_started
-                        // setup below. Its preload is loaded after this write
-                        // committed, so the canonical hook_received is part
-                        // of whatever log that setup reads — no splice
+                        // Successful write, no usable preload (a World that
+                        // ignored the opt-in, a bounded hasMore page, or a
+                        // preload that failed validation): take the generic
+                        // run_started setup below. Its preload is loaded after
+                        // this write committed, so the canonical hook_received
+                        // is part of whatever log that setup reads — no splice
                         // needed.
                         span?.setAttributes(
                           Attribute.HookResumeSetupSource(
