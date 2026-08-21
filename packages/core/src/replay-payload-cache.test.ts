@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import type { Event, WorkflowRun } from '@workflow/world';
 import { assert, describe, expect, it, vi } from 'vitest';
 import { importKey } from './encryption.js';
@@ -73,7 +74,7 @@ describe('ReplayPayloadCache', () => {
   });
 
   it('compacts prepared bytes before retaining them', async () => {
-    const backing = new Uint8Array(64 * 1024);
+    const backing = Buffer.alloc(64 * 1024);
     const prepared = backing.subarray(1024, 2048);
     const cache = new ReplayPayloadCache(
       undefined,
@@ -92,7 +93,8 @@ describe('ReplayPayloadCache', () => {
         'data' in retained &&
         retained.data instanceof Uint8Array
     );
-    expect(retained.data).toEqual(prepared);
+    expect(Array.from(retained.data)).toEqual(Array.from(prepared));
+    expect(retained.data).not.toBeInstanceOf(Buffer);
     expect(retained.data.buffer.byteLength).toBe(retained.data.byteLength);
   });
 

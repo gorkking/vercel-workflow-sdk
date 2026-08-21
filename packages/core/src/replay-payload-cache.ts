@@ -29,7 +29,7 @@ type ReplayPayloadKey = string | typeof WORKFLOW_INPUT;
 function compactOwnedBytes(data: Uint8Array): Uint8Array {
   return data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
     ? data
-    : data.slice();
+    : new Uint8Array(data);
 }
 
 function isCacheablePrimitive(value: unknown): boolean {
