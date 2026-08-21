@@ -1,5 +1,23 @@
 # workflow
 
+## 4.8.5
+
+### Patch Changes
+
+- [#3554](https://github.com/vercel/workflow/pull/3554) [`608769d`](https://github.com/vercel/workflow/commit/608769dc5ff856deb41d4ed29713ce05d7a45a54) Thanks [@VaguelySerious](https://github.com/VaguelySerious)! - Fix a replay-determinism gap where branch wake order — and therefore step correlation ids — could depend on how much of the event log an invocation had loaded, corrupting runs under concurrent replays (CORRUPTED_EVENT_LOG).
+
+- Updated dependencies [[`5556b4c`](https://github.com/vercel/workflow/commit/5556b4cde500aa7d7156be0ed98ff95c61f26ccf), [`608769d`](https://github.com/vercel/workflow/commit/608769dc5ff856deb41d4ed29713ce05d7a45a54)]:
+  - @workflow/core@4.8.5
+  - @workflow/cli@4.3.9
+  - @workflow/next@4.1.9
+  - @workflow/nitro@4.1.11
+  - @workflow/typescript-plugin@4.0.3
+  - @workflow/astro@4.0.20
+  - @workflow/nest@4.0.21
+  - @workflow/rollup@4.0.20
+  - @workflow/sveltekit@4.0.20
+  - @workflow/nuxt@4.0.21
+
 ## 4.8.4
 
 ### Patch Changes

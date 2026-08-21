@@ -1,5 +1,13 @@
 # @workflow/core
 
+## 4.8.5
+
+### Patch Changes
+
+- [#3675](https://github.com/vercel/workflow/pull/3675) [`5556b4c`](https://github.com/vercel/workflow/commit/5556b4cde500aa7d7156be0ed98ff95c61f26ccf) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Step-argument serialization failures now fail the step with a catchable error (via a `step_failed` event, like a step-body failure) instead of failing the run from outside the workflow, and when uncaught they fail the run immediately as a `USER_ERROR` rather than retrying until max queue deliveries.
+
+- [#3554](https://github.com/vercel/workflow/pull/3554) [`608769d`](https://github.com/vercel/workflow/commit/608769dc5ff856deb41d4ed29713ce05d7a45a54) Thanks [@VaguelySerious](https://github.com/VaguelySerious)! - Fix a replay-determinism gap where branch wake order — and therefore step correlation ids — could depend on how much of the event log an invocation had loaded, corrupting runs under concurrent replays (CORRUPTED_EVENT_LOG).
+
 ## 4.8.4
 
 ### Patch Changes
